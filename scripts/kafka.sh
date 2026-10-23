@@ -17,9 +17,16 @@ CONTROLLER_PORT="${FLOWCAST_KAFKA_CONTROLLER_PORT:-9193}"
 KAFKA_BIN="${KAFKA_BIN:-/opt/homebrew/opt/kafka/bin}"
 # Kafka 4 runs on Java 17+; Java 21 is what Spark uses here too (DESIGN.md "Kafka").
 export JAVA_HOME="${FLOWCAST_JAVA_HOME:-/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home}"
-export LOG_DIR="$DIR/logs"
-MARKER="$DIR/.flowcast-kafka"
-PIDFILE="$DIR/kafka.pid"
+# Everything below is derived from DIR. set_paths makes DIR physical first (no symlinks, no ./ or ..), so the config
+# path on the broker's command line, which running_pid looks for, is the same however the directory was spelled:
+# through a symlink or not (/tmp is /private/tmp on macOS), relative or absolute.
+set_paths() {
+  if [ -d "$DIR" ]; then DIR="$(cd "$DIR" && pwd -P)"; fi
+  export LOG_DIR="$DIR/logs"
+  MARKER="$DIR/.flowcast-kafka"
+  PIDFILE="$DIR/kafka.pid"
+}
+set_paths
 START_TIMEOUT="${FLOWCAST_KAFKA_START_TIMEOUT:-60}"
 
 die() { echo "kafka.sh: $*" >&2; exit 1; }
@@ -90,6 +97,7 @@ start() {
     die "$DIR exists and wasn't made by this script"
   fi
   mkdir -p "$DIR/logs"
+  set_paths  # the directory exists now, so this is its physical path: the one the broker is started with
   touch "$MARKER"
   write_config
   if [ ! -f "$DIR/data/meta.properties" ]; then
@@ -100,10 +108,12 @@ start() {
   fi
   : > "$DIR/logs/console.log"
   nohup "$server" "$DIR/server.properties" > "$DIR/logs/console.log" 2>&1 &
-  echo $! > "$PIDFILE"
+  local child=$!
+  echo "$child" > "$PIDFILE"
   local deadline=$((SECONDS + START_TIMEOUT))
   until grep -q "Kafka Server started" "$DIR/logs/console.log"; do
-    if ! running_pid >/dev/null; then
+    # The child itself, not running_pid: until it has exec'd, its command line is still this script's.
+    if ! kill -0 "$child" 2>/dev/null; then
       tail -20 "$DIR/logs/console.log" >&2
       rm -f "$PIDFILE"
       die "kafka exited during startup"
@@ -120,6 +130,16 @@ start() {
 stop() {
   local pid
   if ! pid="$(running_pid)"; then
+    local recorded
+    recorded="$(cat "$PIDFILE" 2>/dev/null || true)"
+    case "$recorded" in '' | *[!0-9]* | 0) ;; *)
+      if kill -0 "$recorded" 2>/dev/null; then
+        # Alive but not provably this directory's broker: neither signal it nor drop the only record of it.
+        echo "kafka.sh: pid $recorded in $PIDFILE is alive but wasn't started with $DIR/server.properties;" \
+          "leaving it and the pid file alone" >&2
+        return 1
+      fi ;;
+    esac
     rm -f "$PIDFILE"
     echo "kafka not running"
     return 0
