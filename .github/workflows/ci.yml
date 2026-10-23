@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      kafka:
+        # The same Kafka version as Homebrew's on the laptop. Setting any KAFKA_ variable replaces the image's default
+        # config, so every setting a single KRaft node needs is here. Clients on the runner reach it through the
+        # mapped port, so that is the address it advertises.
+        image: apache/kafka:4.3.1
+        ports:
+          - 9192:9092
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9192
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_NUM_PARTITIONS: 6
+          KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    env:
+      FLOWCAST_TEST_BOOTSTRAP: localhost:9192
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: pip install -e '.[dev]'
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Type-check
+        run: mypy
+      - name: Wait for Kafka
+        # No health check on the service: the advertised address is the runner's, which doesn't exist inside the
+        # container, so a check from in there can't use it. The tests' own wait runs here instead.
+        run: python -c "from flowcast.kafka_io import wait_for_broker; wait_for_broker('localhost:9192', 90)"
+      - name: Test
+        run: pytest --cov --cov-report=term-missing
+
+  kafka-script:
+    # scripts/kafka.sh on Linux against the Apache tarball (the laptop uses Homebrew's), on Java 21.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      KAFKA_VERSION: 4.3.1
+      # The tarball's SHA-256, the one Homebrew's kafka formula pins for the same file.
+      KAFKA_SHA256: f118328b2d053497350d5befd82c08db7ffd710327ff52943dd5caaa1b25db21
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: pip install -e '.[dev]'
+      - name: Download Kafka
+        run: |
+          curl -fsSL -o kafka.tgz "https://archive.apache.org/dist/kafka/$KAFKA_VERSION/kafka_2.13-$KAFKA_VERSION.tgz"
+          echo "$KAFKA_SHA256  kafka.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/kafka"
+          tar -xzf kafka.tgz -C "$RUNNER_TEMP/kafka" --strip-components 1
+      - name: Test the script
+        env:
+          FLOWCAST_TEST_KAFKA_SCRIPT: "1"
+        run: |
+          export KAFKA_BIN="$RUNNER_TEMP/kafka/bin"
+          export FLOWCAST_JAVA_HOME="$JAVA_HOME"
+          pytest tests/test_kafka_script.py -v
