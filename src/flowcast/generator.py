@@ -23,6 +23,9 @@ from typing import Literal, TypeVar
 from flowcast.schema import MAX_EVENT_TIME, MAX_QUANTITY, MIN_EVENT_TIME, Event
 
 DEFAULT_START_MS = 1_767_225_600_000  # 2026-01-01T00:00:00Z
+# A year before the schema's limit, so a stream has a year of event time before an event would pass 2100-01-01 (the
+# generator stops with an error if it gets there rather than make an invalid event).
+LATEST_START_MS = MAX_EVENT_TIME - 365 * 24 * 3600 * 1000
 
 CATEGORIES = ("books", "electronics", "home_garden", "toys", "clothing", "sports", "beauty", "grocery", "music", "pets")
 # A category's typical price in cents; each product's price is spread around it.
@@ -71,8 +74,11 @@ class Config:
     max_session_events: int = 60
 
     def __post_init__(self) -> None:
-        if not MIN_EVENT_TIME <= self.start_ms < MAX_EVENT_TIME:
-            raise ValueError("start_ms must be between 2000-01-01 and 2100-01-01")
+        if self.seed < 0:
+            # random.Random uses a seed's absolute value, so -n would repeat n's stream under other event ids.
+            raise ValueError("seed must not be negative")
+        if not MIN_EVENT_TIME <= self.start_ms <= LATEST_START_MS:
+            raise ValueError("start_ms must be between 2000-01-01 and 2099-01-01")
         if self.users < 1 or self.products < 1:
             raise ValueError("users and products must be at least 1")
         if not 0 < self.sessions_per_second <= 1_000_000:
@@ -227,7 +233,12 @@ class Generator:
         self._sessions += 1
         event_type: str | None = "page_view"
         emitted = 0
-        while event_type is not None and emitted < self.config.max_session_events:
+        while event_type is not None:
+            # A purchase writes one event per cart line, so its size is known before the step: a session ends
+            # rather than take a step that would put it past max_session_events.
+            size = len(session.cart) if event_type == "purchase" else 1
+            if emitted + size > self.config.max_session_events:
+                break
             emitted += self._step(session, event_type)
             if event_type == "remove_from_cart" and not session.cart:
                 event_type = self._draw.weighted(EMPTY_CART_AFTER_REMOVE)
@@ -273,6 +284,8 @@ class Generator:
         self, session: _Session, event_type: str, page: str, product: _Product | None, quantity: int | None
     ) -> None:
         config = self.config
+        if session.time_ms >= MAX_EVENT_TIME:
+            raise OverflowError("the stream reached 2100-01-01, the schema's limit for event_time")
         digest = hashlib.blake2b(f"{config.seed}:{self._events}".encode(), digest_size=16).digest()
         self._events += 1
         event = Event(

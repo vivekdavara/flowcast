@@ -122,7 +122,7 @@ def check_sessions(records: list[Emitted]) -> None:
         first = events[0].event
         assert first.event_type == "page_view"
         cart: dict[str, int] = {}
-        checked_out = False
+        checked_out = purchasing = False
         for record in events:
             event = record.event
             assert (event.user_id, event.device, event.country) == (first.user_id, first.device, first.country)
@@ -138,8 +138,13 @@ def check_sessions(records: list[Emitted]) -> None:
             elif event.event_type == "purchase":
                 assert checked_out and event.product_id is not None
                 assert cart.pop(event.product_id) == event.quantity
-                if not cart:
-                    checked_out = False
+                purchasing = True
+                continue
+            if purchasing:
+                assert not cart, "a purchase buys every cart line"
+                purchasing = checked_out = False
+        if purchasing:
+            assert not cart, "a purchase buys every cart line"
 
 
 def test_sessions_follow_the_walks_rules(complete: list[Emitted]) -> None:
@@ -234,6 +239,8 @@ def test_no_disorder_means_every_record_is_on_time_and_unique() -> None:
         ({"very_late_min_ms": 2_000_000}, "very_late_min_ms"),
         ({"max_session_events": 0}, "max_session_events"),
         ({"start_ms": 0}, "start_ms"),
+        ({"start_ms": 4_070_908_800_001}, "start_ms"),  # a millisecond after 2099-01-01
+        ({"seed": -1}, "seed"),
     ],
 )
 def test_bad_configs_are_refused(changes: dict[str, float], message: str) -> None:
@@ -266,3 +273,14 @@ def test_a_weighted_draw_at_the_top_of_the_range_takes_the_last_option() -> None
     assert draw.weighted((("a", 0.5), ("b", 0.5))) == "b"
     assert draw.below(10) == 9
     assert draw.skewed(10) == 9
+
+
+def test_the_latest_start_is_accepted_and_a_stream_past_2100_stops_with_an_error() -> None:
+    from flowcast.generator import LATEST_START_MS
+
+    assert sessions(5, Config(start_ms=LATEST_START_MS))
+    generator = Generator(Config(start_ms=LATEST_START_MS))
+    generator._clock = 365 * 24 * 3600 * 1000 - 10_000.0  # ten seconds of event time before 2100
+    with pytest.raises(OverflowError, match="2100-01-01"):
+        for record in generator:
+            encode(record.event)  # every record before the error is valid

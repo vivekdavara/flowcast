@@ -80,10 +80,11 @@ every hard case of streaming happen on purpose, at a known rate:
   a user (skewed: some users are much more active) and walks a Markov chain over event types (landing `page_view`,
   then `product_view`, `add_to_cart`, `remove_from_cart`, `checkout`, `purchase` lines, or exit), with exponential
   think times between steps. A checkout is only reachable with a non-empty cart; a purchase writes one event per cart
-  line.
+  line. A session ends rather than take a step that would put it past `max_session_events` (60) events.
 - **Disorder.** Each event's arrival time is its event time plus a small network delay (5 to 250 ms). A fraction
   (`late_fraction`, 3%) arrive *late*: an extra exponential delay (mean 20 s, capped at 120 s), within the 3-minute
-  watermark. A smaller fraction (`very_late_fraction`, 0.2%) arrive *very late*: 5 to 30 minutes, past the watermark,
+  watermark. The label says which group a record was drawn into, not how late it ended up: an exponential delay can
+  be close to 0, so a few "late" records arrive as early as on-time ones. A smaller fraction (`very_late_fraction`, 0.2%) arrive *very late*: 5 to 30 minutes, past the watermark,
   so a streaming aggregate must drop them and only the backfill sees them.
 - **Duplicates.** A fraction (`duplicate_fraction`, 1%) are sent twice: the copy has the same `event_id` and the same
   bytes, and arrives 0.1 to 5 s after the original (a client that retried after a lost acknowledgement). The idempotent
@@ -91,7 +92,8 @@ every hard case of streaming happen on purpose, at a known rate:
 - **Bounded memory.** Sessions are generated in start-time order and their events go into a heap keyed by
   (arrival time, sequence number). An event can be emitted once the next session's start time is past its arrival
   time: every later event happens at or after that start and arrives no earlier. The heap holds the events still
-  "in flight", about 30 minutes of very late ones at most.
+  "in flight": at most `very_late_max_ms` of very late ones (30 minutes at the defaults), so memory grows with that
+  setting times the event rate.
 - **Determinism.** The same configuration and seed give the same events, byte for byte. Python only promises that
   `random.Random(seed).random()` keeps its sequence across versions (not `choice`, `randrange` or `expovariate`), so
   every draw is made from `random()` alone, and event ids are a hash of (seed, sequence number) rather than random
