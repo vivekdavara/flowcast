@@ -6,6 +6,7 @@ DESIGN.md "Kafka". Records are keyed by user_id, so one user's events stay in on
 from __future__ import annotations
 
 import logging
+import math
 import time
 import uuid
 from collections.abc import Iterable
@@ -23,6 +24,12 @@ TOPIC = "clickstream"
 PARTITIONS = 6
 # Bounded by time and by size per partition, so a long benchmark can't fill a laptop disk.
 TOPIC_CONFIG = {"retention.ms": str(7 * 24 * 3600 * 1000), "retention.bytes": str(1 << 30)}
+
+# Kafka's partition count is a 32-bit signed integer.
+MAX_PARTITIONS = 2**31 - 1
+# Errors a partition gives for a moment after its topic is created, while the broker takes up leadership.
+_SETTLING = frozenset({RdKafkaError.NOT_LEADER_FOR_PARTITION, RdKafkaError.LEADER_NOT_AVAILABLE})
+_POLL_S = 0.1
 
 # librdkafka reports every refused connection itself; route that to logging rather than stderr.
 _log = logging.getLogger("flowcast.kafka")
@@ -42,6 +49,8 @@ def _admin(bootstrap: str) -> AdminClient:
 
 def wait_for_broker(bootstrap: str, timeout_s: float = 60.0) -> None:
     """Return once the broker answers a metadata request; raise KafkaError after `timeout_s`."""
+    if not math.isfinite(timeout_s) or timeout_s < 0:
+        raise ValueError("timeout_s must be a finite number of seconds, at least 0")
     admin = _admin(bootstrap)
     deadline = time.monotonic() + timeout_s
     while True:
@@ -62,23 +71,38 @@ def ensure_topic(
     config: dict[str, str] | None = None,
     timeout_s: float = 30.0,
 ) -> bool:
-    """Create the topic if it doesn't exist; True if this call created it. An existing topic with a different
-    partition count is an error: key-to-partition mapping depends on it, so it isn't silently accepted."""
+    """Create the topic if it doesn't exist; True if this call created it. Returns once the broker serves every
+    partition (a leader for each), so the topic can be written and read at once. An existing topic with a different
+    partition count is an error: key-to-partition mapping depends on it, so it isn't silently accepted. `config`
+    None means TOPIC_CONFIG; pass {} for the broker's defaults."""
+    if not 1 <= partitions <= MAX_PARTITIONS:
+        raise ValueError(f"partitions must be between 1 and {MAX_PARTITIONS}")
     admin = _admin(bootstrap)
-    existing = _partition_count(admin, name, timeout_s)
-    if existing is None:
-        topic = NewTopic(name, num_partitions=partitions, replication_factor=1, config=config or TOPIC_CONFIG)
+    deadline = time.monotonic() + timeout_s
+    created = False
+    if _served_partitions(admin, name, timeout_s) is None:
+        topic = NewTopic(
+            name,
+            num_partitions=partitions,
+            replication_factor=1,
+            config=TOPIC_CONFIG if config is None else config,
+        )
         try:
             admin.create_topics([topic], operation_timeout=timeout_s, request_timeout=timeout_s)[name].result()
-            return True
+            created = True
         except KafkaException as exc:
             if exc.args[0].code() != RdKafkaError.TOPIC_ALREADY_EXISTS:
                 raise KafkaError(f"creating topic {name} failed: {exc.args[0].str()}") from exc
             # Someone else created it between our check and our create: check it like any existing topic.
-            existing = _partition_count(admin, name, timeout_s)
+    # The controller has the topic once the create returns, but the broker's metadata (and its leadership of each
+    # partition) can lag it: a racing creator's re-read, or a reader right after, could find no topic yet.
+    while (existing := _served_partitions(admin, name, timeout_s)) is None:
+        if time.monotonic() >= deadline:
+            raise KafkaError(f"topic {name} isn't served by the broker after {timeout_s:g}s")
+        time.sleep(_POLL_S)
     if existing != partitions:
         raise KafkaError(f"topic {name} has {existing} partitions, not {partitions}")
-    return False
+    return created
 
 
 def delete_topic(bootstrap: str, name: str, timeout_s: float = 30.0) -> None:
@@ -90,7 +114,9 @@ def delete_topic(bootstrap: str, name: str, timeout_s: float = 30.0) -> None:
             raise KafkaError(f"deleting topic {name} failed: {exc.args[0].str()}") from exc
 
 
-def _partition_count(admin: AdminClient, name: str, timeout_s: float) -> int | None:
+def _served_partitions(admin: AdminClient, name: str, timeout_s: float) -> int | None:
+    """The topic's partition count once every partition has a leader; None while it doesn't exist (or isn't served
+    yet)."""
     try:
         metadata = admin.list_topics(topic=name, timeout=timeout_s)
     except KafkaException as exc:
@@ -98,8 +124,10 @@ def _partition_count(admin: AdminClient, name: str, timeout_s: float) -> int | N
     topic = metadata.topics.get(name)
     if topic is None or (topic.error is not None and topic.error.code() == RdKafkaError.UNKNOWN_TOPIC_OR_PART):
         return None
-    if topic.error is not None:
+    if topic.error is not None and topic.error.code() not in _SETTLING:
         raise KafkaError(f"topic {name}: {topic.error.str()}")
+    if topic.error is not None or not topic.partitions or any(p.leader < 0 for p in topic.partitions.values()):
+        return None
     return len(topic.partitions)
 
 
@@ -133,16 +161,22 @@ def produce(bootstrap: str, topic: str, events: Iterable[Event], flush_timeout_s
 
     sent = 0
     started = time.perf_counter()
-    for event in events:
-        value = encode(event)
-        while True:
-            try:
-                producer.produce(topic, value=value, key=event.user_id.encode(), on_delivery=on_delivery)
-                break
-            except BufferError:
-                producer.poll(0.05)  # the local queue is full: serve delivery reports until there is room
-        sent += 1
-        producer.poll(0)
+    try:
+        for event in events:
+            value = encode(event)
+            while True:
+                try:
+                    producer.produce(topic, value=value, key=event.user_id.encode(), on_delivery=on_delivery)
+                    break
+                except BufferError:
+                    producer.poll(0.05)  # the local queue is full: serve delivery reports until there is room
+            sent += 1
+            producer.poll(0)
+    except BaseException:
+        # The events failed part way (a bad event, an interrupt): deliver what was already sent before raising, so
+        # the topic holds a known prefix rather than whatever happened to leave the queue.
+        producer.flush(flush_timeout_s)
+        raise
     left = producer.flush(flush_timeout_s)
     seconds = time.perf_counter() - started
     if failures:
@@ -231,9 +265,16 @@ def _watermarks(consumer: Consumer, topic: str, timeout_s: float) -> dict[int, t
     if info is None or info.error is not None:
         raise KafkaError(f"no topic {topic}")
     marks: dict[int, tuple[int, int]] = {}
+    deadline = time.monotonic() + timeout_s
     for partition in sorted(info.partitions):
-        try:
-            marks[partition] = consumer.get_watermark_offsets(TopicPartition(topic, partition), timeout=timeout_s)
-        except KafkaException as exc:
-            raise KafkaError(f"no offsets for {topic} partition {partition}: {exc.args[0].str()}") from exc
+        while partition not in marks:
+            try:
+                marks[partition] = consumer.get_watermark_offsets(
+                    TopicPartition(topic, partition), timeout=max(0.1, deadline - time.monotonic())
+                )
+            except KafkaException as exc:
+                # A partition of a topic created a moment ago may not have taken up its leader yet: wait for it.
+                if exc.args[0].code() not in _SETTLING or time.monotonic() >= deadline:
+                    raise KafkaError(f"no offsets for {topic} partition {partition}: {exc.args[0].str()}") from exc
+                time.sleep(_POLL_S)
     return marks

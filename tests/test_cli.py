@@ -132,7 +132,7 @@ def test_topic_produce_and_count(capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_a_topic_needs_at_least_one_partition(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["topic", "--partitions", "0", "--bootstrap", "127.0.0.1:1"]) == 2
-    assert capsys.readouterr().err == "flowcast topic: --partitions must be at least 1\n"
+    assert capsys.readouterr().err == "flowcast topic: --partitions must be between 1 and 2147483647\n"
 
 
 def test_a_closed_pipe_ends_generate_quietly() -> None:

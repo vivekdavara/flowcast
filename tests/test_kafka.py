@@ -9,10 +9,20 @@ from collections import Counter, defaultdict
 from collections.abc import Iterator
 
 import pytest
+from confluent_kafka import TopicPartition
+from confluent_kafka.admin import AdminClient, ConfigResource
 
 from flowcast.generator import sessions
-from flowcast.kafka_io import KafkaError, delete_topic, ensure_topic, produce, read_topic, wait_for_broker
-from flowcast.schema import decode, encode
+from flowcast.kafka_io import (
+    KafkaError,
+    delete_topic,
+    ensure_topic,
+    produce,
+    read_topic,
+    topic_counts,
+    wait_for_broker,
+)
+from flowcast.schema import Event, decode, encode
 
 BOOTSTRAP = os.environ.get("FLOWCAST_TEST_BOOTSTRAP", "")
 
@@ -108,3 +118,40 @@ def test_records_the_broker_rejects_make_produce_fail(topic: str) -> None:
 def test_a_topic_the_broker_refuses_to_create_is_an_error(topic: str) -> None:
     with pytest.raises(KafkaError, match=f"creating topic {topic} failed: .*retention.ms"):
         ensure_topic(BOOTSTRAP, topic, partitions=1, config={"retention.ms": "not-a-number"})
+
+
+def test_a_failure_part_way_leaves_exactly_the_records_sent_before_it(topic: str) -> None:
+    # From the day-1 review's suspicion: an error from the events while producing must not leave a partial,
+    # unflushed queue; what was sent before it is delivered, nothing after.
+    ensure_topic(BOOTSTRAP, topic, partitions=2)
+    events = [record.event for record in sessions(20)][:10]
+
+    def failing() -> Iterator[Event]:
+        yield from events
+        raise RuntimeError("the source broke")
+
+    with pytest.raises(RuntimeError, match="the source broke"):
+        produce(BOOTSTRAP, topic, failing())
+    assert sorted(r.value for r in read_topic(BOOTSTRAP, topic)) == sorted(encode(e) for e in events)
+
+
+def test_reading_and_counting_start_at_the_low_watermark(topic: str) -> None:
+    # The day-1 review's surviving mutants read from offset 0 and counted `high` alone; neither shows until records
+    # are deleted from the front of a partition.
+    ensure_topic(BOOTSTRAP, topic, partitions=1)
+    events = [record.event for record in sessions(10)]
+    produce(BOOTSTRAP, topic, events)
+    admin = AdminClient({"bootstrap.servers": BOOTSTRAP})
+    admin.delete_records([TopicPartition(topic, 0, 5)])[TopicPartition(topic, 0, 5)].result()
+    read = read_topic(BOOTSTRAP, topic)
+    assert [r.offset for r in read] == list(range(5, len(events)))
+    assert [r.value for r in read] == [encode(e) for e in events[5:]]
+    assert topic_counts(BOOTSTRAP, topic) == {0: len(events) - 5}
+
+
+def test_an_empty_config_means_the_brokers_defaults(topic: str) -> None:
+    ensure_topic(BOOTSTRAP, topic, partitions=1, config={})
+    admin = AdminClient({"bootstrap.servers": BOOTSTRAP})
+    resource = ConfigResource("topic", topic)
+    configs = admin.describe_configs([resource])[resource].result()
+    assert configs["retention.bytes"].value == "-1"  # TOPIC_CONFIG would have set 1 GiB

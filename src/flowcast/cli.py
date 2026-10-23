@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import sys
 from collections.abc import Iterator, Sequence
@@ -18,6 +19,7 @@ from flowcast import __version__
 from flowcast.generator import Config, Emitted, Generator
 from flowcast.kafka_io import (
     DEFAULT_BOOTSTRAP,
+    MAX_PARTITIONS,
     PARTITIONS,
     TOPIC,
     KafkaError,
@@ -44,6 +46,17 @@ def _positive(text: str) -> int:
     return value
 
 
+def _seconds(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from None
+    # NaN compares false with everything, so a deadline of NaN never passes: refuse it, and infinity, outright.
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"must be a finite number of seconds, at least 0: {text}")
+    return value
+
+
 def _stream_options(parser: argparse.ArgumentParser, *, from_file: bool = False) -> None:
     size = parser.add_mutually_exclusive_group(required=True)
     size.add_argument("--sessions", type=_positive, help="every record of this many whole sessions")
@@ -59,7 +72,9 @@ def _stream_options(parser: argparse.ArgumentParser, *, from_file: bool = False)
 def _kafka_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--bootstrap", default=DEFAULT_BOOTSTRAP, help="Kafka bootstrap servers (default %(default)s)")
     parser.add_argument("--topic", default=TOPIC, help="topic (default %(default)s)")
-    parser.add_argument("--wait", type=float, default=30.0, help="seconds to wait for the broker (default %(default)s)")
+    parser.add_argument(
+        "--wait", type=_seconds, default=30.0, help="seconds to wait for the broker (default %(default)s)"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -143,8 +158,8 @@ def _truth(args: argparse.Namespace) -> None:
 
 
 def _topic(args: argparse.Namespace) -> None:
-    if args.partitions < 1:
-        raise UsageError("--partitions must be at least 1")
+    if not 1 <= args.partitions <= MAX_PARTITIONS:
+        raise UsageError(f"--partitions must be between 1 and {MAX_PARTITIONS}")
     wait_for_broker(args.bootstrap, timeout_s=args.wait)
     created = ensure_topic(args.bootstrap, args.topic, partitions=args.partitions)
     print(f"topic {args.topic}: {'created' if created else 'exists'}, {args.partitions} partitions")
