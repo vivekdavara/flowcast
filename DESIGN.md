@@ -92,11 +92,13 @@ every hard case of streaming happen on purpose, at a known rate:
   (arrival time, sequence number). An event can be emitted once the next session's start time is past its arrival
   time: every later event happens at or after that start and arrives no earlier. The heap holds the events still
   "in flight", about 30 minutes of very late ones at most.
-- **Determinism.** The same configuration and seed give the same events, byte for byte, on any machine and any
-  Python version. Python only promises that `random.Random(seed).random()` keeps its sequence across versions (not
-  `choice`, `randrange` or `expovariate`), so every draw is made from `random()` alone, and event ids are a hash of
-  (seed, sequence number) rather than random bits. A test pins the SHA-256 of the first 10,000 events; a deliberate
-  change to the generator re-pins it, in the same commit, saying why.
+- **Determinism.** The same configuration and seed give the same events, byte for byte. Python only promises that
+  `random.Random(seed).random()` keeps its sequence across versions (not `choice`, `randrange` or `expovariate`), so
+  every draw is made from `random()` alone, and event ids are a hash of (seed, sequence number) rather than random
+  bits. Exponential draws use `math.log`, which C libraries aren't required to round identically, so "on any machine"
+  is checked rather than assumed: a test pins the SHA-256 of the first 10,000 records (arrival times and bytes), and CI
+  runs it on Linux as the laptop does on macOS. A deliberate change to the generator re-pins it, in the same commit,
+  saying why.
 
 Each emitted record carries the event and its simulated arrival time, plus labels a real collector wouldn't have
 (`late`, `very_late`, `duplicate`): the tests and the ground truth use them, the producer sends only the event.
