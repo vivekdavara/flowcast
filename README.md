@@ -86,15 +86,17 @@ Measured on an Apple M3 (macOS 26.6.2, Python 3.11.12), on battery, Low Power Mo
 
 | What | Result | Command |
 |---|---|---|
-| Generator, 50,000 sessions (198,236 records) | **200,425 records/s** (0.989 s, median of 5) | `.venv/bin/python scripts/measure_generator.py` |
-| Generator + `encode` (validation and JSON) | **62,907 records/s** (3.151 s, median of 5): encoding is about 69% of the time | same |
+| Generator, 50,000 sessions (198,236 records) | **181,902 records/s** (1.090 s, median of 5) at `b6aefbb`; 200,425 (0.989 s) at `26b835e` | `.venv/bin/python scripts/measure_generator.py` |
+| Generator + `encode` (validation and JSON) | **62,278 records/s** (3.183 s) at `b6aefbb`; 62,907 (3.151 s) at `26b835e`: encoding is about two-thirds of the time | same |
 | Records the generator holds in memory | peak **1,810** pending (sampled every 1,024 records), 1,855 over the first 100,000 records of the endless stream | same; `test_memory_stays_bounded_while_streaming` |
 | Records per session at the defaults | 3.9 (38,963 events in 10,000 sessions, plus 383 duplicate copies) | `.venv/bin/python -c "from flowcast.generator import sessions; c = sessions(10_000); print(len(c), sum(r.duplicate for r in c))"` |
 | Determinism | the SHA-256 of the first 10,000 records is the same on macOS (here) and Linux (CI) | `test_the_first_10k_records_match_the_pinned_hash` |
 | Kafka round trip | 300 sessions through a 6-partition topic: every record back byte for byte, one partition per user, each user's records in send order | `tests/test_kafka.py` |
 
-The generator run above had a review agent open in the background (idle at the time: load average 1.66 before, 2.06
-after). These numbers size day 2's producer runs; the encode cost (the strict checks run on every record) is the
+Two runs on battery (40% and 28%): at `26b835e` with a review agent open but idle (load average 1.66 before, 2.06
+after), and at `b6aefbb` right after the test suite had run (load 4.21 before, 3.85 after). Both made the same 198,236
+records; the gap in generation speed isn't separated between the code (an event-time check per event was added) and
+the load. These numbers size day 2's producer runs; the encode cost (the strict checks run on every record) is the
 first thing day 2's volume producer will look at.
 
 ## Tests
@@ -116,7 +118,8 @@ first thing day 2's volume producer will look at.
 
 - `tests/test_kafka_config.py`: the producer stays idempotent with `acks=all` (a fake producer, no broker); waits that
   could never end are refused.
-- `tests/review/`: the day-1 review's findings as tests, each failing at the commit it reviewed (`943596b`).
+- `tests/review/` and `tests/review2/`: the two day-1 reviews' findings as tests, each failing at the commit it
+  reviewed (`943596b`, `a403362`).
 
 CI (`.github/workflows/ci.yml`): lint, types and every test against an `apache/kafka:4.3.1` service container; and
 `scripts/kafka.sh` against the Apache tarball (SHA-256 checked) on Java 21.
@@ -145,6 +148,15 @@ the review's mutant that bought only the first line was caught only by the slow 
 10,000-session rules test as well. Its doubt about DESIGN's watermark accounting matched a correction already made from Spark's
 source (`26b835e`).
 
+A second agent then read only the fixes (`943596b..a403362`, 16:39 to 16:48) and found two regressions in them, both
+fixed (`tests/review2/`, 4 tests): `kafka.sh`'s new pid check compared the config path as a string, so the same
+directory spelled another way (a symlink; `/tmp` is `/private/tmp` on macOS; `./kafka`) made `stop` delete the pid
+file of the live broker and leave it running unfound; the script now resolves the directory to its physical path
+first, and keeps a pid file it can't verify. And `produce`'s new flush after an error was one long call into
+librdkafka, which holds off Python's signal handling, so a second Ctrl-C couldn't end it; it flushes in 0.1 s slices
+now. From its suspicions: every Kafka call refuses NaN or infinite timeouts, `ensure_topic`'s calls share one
+deadline, and a prefix that wasn't all delivered says so on the error. No third review this time.
+
 ## Design decisions
 
 - **Integer cents and integer milliseconds**, so Python, DuckDB and Spark compute identical answers, compared with `==`.
@@ -166,6 +178,10 @@ source (`26b835e`).
 - The generator is single-threaded Python; `produce` sends as fast as it can, with no pacing by arrival time (day 2).
 - Event-time skew between devices isn't modelled: each event's time is its true time, and lateness is all in transit.
 - One broker, replication factor 1: this is a laptop pipeline, not a fault-tolerant cluster.
+- `read_topic` gives up on any consumer error rather than retrying transient ones, and can't finish a compacted or
+  transactional topic (it reads to the high-water mark). Untested still: its skip of records written after the
+  snapshot, and `delete_topic` swallowing errors. A topic deleted in the middle of a create race is reported as "not
+  served" after the full timeout.
 
 ## License
 
