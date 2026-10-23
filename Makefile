@@ -1,4 +1,6 @@
 PY := .venv/bin/python
+# The Kafka tests need a broker; `make kafka-start` runs the local one this points at (CI sets its own).
+export FLOWCAST_TEST_BOOTSTRAP ?= 127.0.0.1:9192
 
 .PHONY: venv lint test check coverage kafka-start kafka-stop
 
@@ -19,3 +21,9 @@ check: lint test
 
 coverage:
 	$(PY) -m pytest --cov --cov-report=term-missing
+
+kafka-start:
+	scripts/kafka.sh start
+
+kafka-stop:
+	scripts/kafka.sh stop
