@@ -23,6 +23,17 @@ START_TIMEOUT="${FLOWCAST_KAFKA_START_TIMEOUT:-60}"
 
 die() { echo "kafka.sh: $*" >&2; exit 1; }
 
+# Homebrew installs the tools without the .sh the Apache tarball has (bin/kafka-server-start.sh); take either.
+tool() {
+  if [ -x "$KAFKA_BIN/$1" ]; then
+    echo "$KAFKA_BIN/$1"
+  elif [ -x "$KAFKA_BIN/$1.sh" ]; then
+    echo "$KAFKA_BIN/$1.sh"
+  else
+    die "no $1 in $KAFKA_BIN (brew install kafka, or set KAFKA_BIN to a Kafka bin directory)"
+  fi
+}
+
 running_pid() {
   [ -f "$PIDFILE" ] || return 1
   local pid
@@ -30,7 +41,9 @@ running_pid() {
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo "$pid"
 }
 
-listening() { lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
+# A connect, not lsof: it needs no tool, and on macOS it also sees a listener on *:port, which can coexist with a
+# bind to 127.0.0.1:port.
+listening() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
 write_config() {
   cat > "$DIR/server.properties" <<EOF
@@ -63,7 +76,9 @@ start() {
   for port in "$PORT" "$CONTROLLER_PORT"; do
     listening "$port" && die "something else is listening on port $port"
   done
-  [ -x "$KAFKA_BIN/kafka-server-start" ] || die "no Kafka at $KAFKA_BIN (brew install kafka, or set KAFKA_BIN)"
+  local server storage
+  server="$(tool kafka-server-start)"
+  storage="$(tool kafka-storage)"
   [ -x "$JAVA_HOME/bin/java" ] || die "no Java at $JAVA_HOME (brew install openjdk@21, or set FLOWCAST_JAVA_HOME)"
   if [ -e "$DIR" ] && [ ! -f "$MARKER" ] && [ -n "$(ls -A "$DIR")" ]; then
     die "$DIR exists and wasn't made by this script"
@@ -73,12 +88,12 @@ start() {
   write_config
   if [ ! -f "$DIR/data/meta.properties" ]; then
     local cluster_id
-    cluster_id="$("$KAFKA_BIN/kafka-storage" random-uuid)"
-    "$KAFKA_BIN/kafka-storage" format -t "$cluster_id" -c "$DIR/server.properties" > "$DIR/logs/format.log" 2>&1 \
+    cluster_id="$("$storage" random-uuid)"
+    "$storage" format -t "$cluster_id" -c "$DIR/server.properties" > "$DIR/logs/format.log" 2>&1 \
       || { cat "$DIR/logs/format.log" >&2; die "formatting the log directory failed"; }
   fi
   : > "$DIR/logs/console.log"
-  nohup "$KAFKA_BIN/kafka-server-start" "$DIR/server.properties" > "$DIR/logs/console.log" 2>&1 &
+  nohup "$server" "$DIR/server.properties" > "$DIR/logs/console.log" 2>&1 &
   echo $! > "$PIDFILE"
   local deadline=$((SECONDS + START_TIMEOUT))
   until grep -q "Kafka Server started" "$DIR/logs/console.log"; do
