@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flowcast"
+version = "0.1.0"
+description = "Streaming analytics pipeline: a synthetic clickstream through Kafka and Spark Structured Streaming into Parquet and DuckDB."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Vivek Davara" }]
+requires-python = ">=3.11"
+dependencies = ["confluent-kafka>=2.16", "duckdb>=2.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=9", "pytest-cov>=6", "hypothesis>=6.150", "ruff==0.17.2", "mypy>=2.4"]
+
+[project.scripts]
+flowcast = "flowcast.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+flowcast = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = ["kafka: needs a Kafka broker at FLOWCAST_TEST_BOOTSTRAP (skipped without one)"]
+
+[tool.coverage.run]
+source = ["flowcast"]
+branch = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [".scratch"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src"]
