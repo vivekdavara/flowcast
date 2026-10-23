@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 import uuid
 from pathlib import Path
 
@@ -126,3 +128,22 @@ def test_topic_produce_and_count(capsys: pytest.CaptureFixture[str]) -> None:
         assert [line.split(":")[0] for line in out[:-1]] == ["partition 0", "partition 1", "partition 2"]
     finally:
         delete_topic(BOOTSTRAP, topic)
+
+
+def test_a_topic_needs_at_least_one_partition(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["topic", "--partitions", "0", "--bootstrap", "127.0.0.1:1"]) == 2
+    assert capsys.readouterr().err == "flowcast topic: --partitions must be at least 1\n"
+
+
+def test_a_closed_pipe_ends_generate_quietly() -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-m", "flowcast.cli", "generate", "--records", "500000"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None and process.stderr is not None
+    assert process.stdout.readline().startswith(b'{"schema_version":1,')
+    process.stdout.close()  # like `head -1` exiting
+    stderr = process.stderr.read()
+    assert process.wait(timeout=60) == 1
+    assert stderr == b""  # no traceback, no "Exception ignored ... BrokenPipeError"

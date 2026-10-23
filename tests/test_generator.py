@@ -7,6 +7,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from flowcast.generator import (
+    DEFAULT_START_MS,
     NETWORK_MAX_MS,
     NETWORK_MIN_MS,
     RETRY_MAX_MS,
@@ -238,3 +239,30 @@ def test_no_disorder_means_every_record_is_on_time_and_unique() -> None:
 def test_bad_configs_are_refused(changes: dict[str, float], message: str) -> None:
     with pytest.raises(ValueError, match=message):
         Config(**changes)  # type: ignore[arg-type]
+
+
+def test_an_add_to_cart_stops_at_the_quantity_limit() -> None:
+    # Reaching 99 of one product in a session is too rare to wait for, so drive one step of the walk directly.
+    from flowcast.generator import _Session
+
+    generator = Generator(Config(products=1, duplicate_fraction=0))
+    product = generator._products[0]
+    session = _Session("s0", generator._users[0], DEFAULT_START_MS, product=product)
+    session.cart[product.product_id] = (product, 98)
+    assert generator._step(session, "add_to_cart") == 1  # adds only the one that fits
+    assert session.cart[product.product_id][1] == 99
+    assert generator._step(session, "add_to_cart") == 0  # full: no event at all
+    assert session.cart[product.product_id][1] == 99
+    emitted = sorted(record.event.quantity for _, _, record in generator._pending)
+    assert emitted == [1]
+
+
+def test_a_weighted_draw_at_the_top_of_the_range_takes_the_last_option() -> None:
+    # random() is below 1, but the running subtraction can round to exactly 0 at the top: the last option, not None.
+    from flowcast.generator import _Draw
+
+    draw = _Draw(0)
+    draw._rng.random = lambda: 1.0  # type: ignore[method-assign]
+    assert draw.weighted((("a", 0.5), ("b", 0.5))) == "b"
+    assert draw.below(10) == 9
+    assert draw.skewed(10) == 9
