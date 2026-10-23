@@ -167,26 +167,13 @@ def read_topic(bootstrap: str, topic: str, timeout_s: float = 60.0) -> list[Reco
     No consumer group is joined and no offsets are committed: partitions are assigned directly and read to the end
     offsets taken at the start, so the read always ends and leaves nothing behind.
     """
-    consumer = Consumer(
-        {
-            **_client_config(bootstrap),
-            "group.id": f"flowcast-reader-{uuid.uuid4()}",  # required by the client; never joined or committed to
-            "enable.auto.commit": False,
-            "enable.auto.offset.store": False,
-            "enable.partition.eof": False,
-        }
-    )
+    consumer = _reader(bootstrap)
     try:
-        metadata = consumer.list_topics(topic=topic, timeout=timeout_s)
-        info = metadata.topics.get(topic)
-        if info is None or info.error is not None:
-            raise KafkaError(f"no topic {topic}")
-        ends: dict[int, int] = {}
         starts: dict[int, int] = {}
-        for partition in sorted(info.partitions):
-            low, high = consumer.get_watermark_offsets(TopicPartition(topic, partition), timeout=timeout_s)
+        ends: dict[int, int] = {}
+        for p, (low, high) in _watermarks(consumer, topic, timeout_s).items():
             if high > low:
-                starts[partition], ends[partition] = low, high
+                starts[p], ends[p] = low, high
         consumer.assign([TopicPartition(topic, p, starts[p]) for p in ends])
         records: list[Record] = []
         position = dict(starts)
@@ -210,3 +197,43 @@ def read_topic(bootstrap: str, topic: str, timeout_s: float = 60.0) -> list[Reco
         consumer.close()
     records.sort(key=lambda r: (r.partition, r.offset))
     return records
+
+
+def topic_counts(bootstrap: str, topic: str, timeout_s: float = 30.0) -> dict[int, int]:
+    """Records in each partition now: high-water mark minus low (exact for this project's non-transactional writes,
+    which put no control records in the log)."""
+    consumer = _reader(bootstrap)
+    try:
+        return {p: high - low for p, (low, high) in _watermarks(consumer, topic, timeout_s).items()}
+    finally:
+        consumer.close()
+
+
+def _reader(bootstrap: str) -> Consumer:
+    return Consumer(
+        {
+            **_client_config(bootstrap),
+            "group.id": f"flowcast-reader-{uuid.uuid4()}",  # required by the client; never joined or committed to
+            "enable.auto.commit": False,
+            "enable.auto.offset.store": False,
+            "enable.partition.eof": False,
+        }
+    )
+
+
+def _watermarks(consumer: Consumer, topic: str, timeout_s: float) -> dict[int, tuple[int, int]]:
+    """(low, high) offsets of each partition, by partition number."""
+    try:
+        metadata = consumer.list_topics(topic=topic, timeout=timeout_s)
+    except KafkaException as exc:
+        raise KafkaError(f"no answer from Kafka: {exc.args[0].str()}") from exc
+    info = metadata.topics.get(topic)
+    if info is None or info.error is not None:
+        raise KafkaError(f"no topic {topic}")
+    marks: dict[int, tuple[int, int]] = {}
+    for partition in sorted(info.partitions):
+        try:
+            marks[partition] = consumer.get_watermark_offsets(TopicPartition(topic, partition), timeout=timeout_s)
+        except KafkaException as exc:
+            raise KafkaError(f"no offsets for {topic} partition {partition}: {exc.args[0].str()}") from exc
+    return marks
