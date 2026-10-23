@@ -95,3 +95,16 @@ def test_deleting_a_missing_topic_is_not_an_error() -> None:
 def test_no_broker_is_reported_after_the_timeout() -> None:
     with pytest.raises(KafkaError, match=r"no Kafka broker at 127\.0\.0\.1:1 "):
         wait_for_broker("127.0.0.1:1", timeout_s=1)
+
+
+def test_records_the_broker_rejects_make_produce_fail(topic: str) -> None:
+    # Every event is over 200 bytes, so a topic that takes at most 100 refuses each record: produce must not succeed.
+    ensure_topic(BOOTSTRAP, topic, partitions=1, config={"max.message.bytes": "100"})
+    events = [record.event for record in sessions(3)]
+    with pytest.raises(KafkaError, match=rf"{len(events)} of {len(events)} records failed; first: .*too large"):
+        produce(BOOTSTRAP, topic, events)
+
+
+def test_a_topic_the_broker_refuses_to_create_is_an_error(topic: str) -> None:
+    with pytest.raises(KafkaError, match=f"creating topic {topic} failed: .*retention.ms"):
+        ensure_topic(BOOTSTRAP, topic, partitions=1, config={"retention.ms": "not-a-number"})
