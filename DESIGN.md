@@ -48,7 +48,7 @@ and always present (`null` where a field doesn't apply), so the same event is al
 | `device` | string | `desktop`, `mobile`, `tablet` |
 | `country` | string | two uppercase letters |
 | `page` | string | `/` then up to 255 printable ASCII characters, no spaces (a percent-encoded path) |
-| `product_id` | string or null | `p` + digits; non-null exactly for `product_view`, `add_to_cart`, `remove_from_cart`, `purchase` |
+| `product_id` | string or null | `p` + digits, at most 32 characters; non-null exactly for `product_view`, `add_to_cart`, `remove_from_cart`, `purchase` |
 | `category` | string or null | lowercase letters and `_`, 1 to 32 characters; non-null exactly when `product_id` is |
 | `price_cents` | int or null | unit price, 1 to 10,000,000; non-null exactly when `product_id` is |
 | `quantity` | int or null | 1 to 99; non-null exactly for `add_to_cart`, `remove_from_cart`, `purchase` |

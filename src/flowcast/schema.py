@@ -74,8 +74,13 @@ def encode(event: Event) -> bytes:
     return json.dumps(dict(zip(FIELDS, astuple(event), strict=True)), separators=(",", ":")).encode()
 
 
-def decode(value: bytes) -> Event:
-    """Parse and check one record. Raises InvalidEvent with the first problem found."""
+def decode(value: bytes | None) -> Event:
+    """Parse and check one record. Raises InvalidEvent with the first problem found.
+
+    None is a Kafka record with no value (a tombstone): not an event, so InvalidEvent too, not a TypeError.
+    """
+    if value is None:
+        raise InvalidEvent("no value")
     try:
         text = value.decode("utf-8")
     except UnicodeDecodeError as exc:

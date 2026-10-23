@@ -214,3 +214,28 @@ def test_any_valid_event_round_trips_byte_for_byte(event: Event) -> None:
     value = encode(event)
     assert decode(value) == event
     assert encode(decode(value)) == value
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"user_id": "u"}, "bad user_id"),
+        ({"session_id": "s"}, "bad session_id"),
+        ({"product_id": "p"}, "bad product_id"),
+        ({"product_id": "p" + "1" * 32}, "bad product_id"),  # 33 characters: the table says at most 32
+        ({"category": "z" * 33}, "bad category"),
+    ],
+)
+def test_ids_need_a_digit_and_lengths_stop_at_the_tables_limits(changes: dict[str, Any], reason: str) -> None:
+    # From the day-1 review's surviving mutants ({1,31} loosened to {0,31}, {1,32} to {1,33}) and its finding that
+    # the table gave product_id no length: the table now says 32 characters, as the pattern always did.
+    with pytest.raises(InvalidEvent, match=reason):
+        decode(raw(make(), **changes))
+    longest = make(product_id="p" + "1" * 31)
+    assert decode(encode(longest)) == longest
+
+
+def test_a_record_with_no_value_is_invalid_not_a_type_error() -> None:
+    # A Kafka tombstone has no value (Record.value is None); day 2 makes it a dead letter like any bad record.
+    with pytest.raises(InvalidEvent, match="no value"):
+        decode(None)
