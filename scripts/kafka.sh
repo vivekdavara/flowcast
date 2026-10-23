@@ -5,7 +5,8 @@
 #
 # Config, data and logs live in .kafka/ (git-ignored). Broker 127.0.0.1:9192, controller 127.0.0.1:9193 (the
 # portfolio's port map). Overrides: FLOWCAST_KAFKA_DIR, FLOWCAST_KAFKA_PORT, FLOWCAST_KAFKA_CONTROLLER_PORT, KAFKA_BIN,
-# FLOWCAST_JAVA_HOME. `reset` deletes the directory, but only one this script made.
+# FLOWCAST_JAVA_HOME. `reset` deletes the directory, but only one holding the script's marker: one it made, or an empty
+# one it was started in. `stop` signals only a process started with this directory's config.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -34,11 +35,16 @@ tool() {
   fi
 }
 
+# The pid in the pid file, if that process is this directory's broker. A pid is reused once its process exits (a
+# crash, a reboot), so a live pid alone proves nothing: the process must have been started with this config.
 running_pid() {
   [ -f "$PIDFILE" ] || return 1
   local pid
   pid="$(cat "$PIDFILE")"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+  case "$pid" in '' | *[!0-9]* | 0) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  ps -ww -p "$pid" -o command= 2>/dev/null | grep -qF -- " $DIR/server.properties" || return 1
+  echo "$pid"
 }
 
 # A connect, not lsof: it needs no tool, and on macOS it also sees a listener on *:port, which can coexist with a
@@ -118,7 +124,7 @@ stop() {
     echo "kafka not running"
     return 0
   fi
-  kill "$pid"
+  kill "$pid" 2>/dev/null || true  # it may have exited since running_pid looked
   for _ in $(seq 1 60); do
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.5

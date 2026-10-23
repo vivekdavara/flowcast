@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from flowcast.generator import sessions
-from flowcast.kafka_io import ensure_topic, produce, read_topic
+from flowcast.kafka_io import KafkaError, ensure_topic, produce, read_topic
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "kafka.sh"
 PORT, CONTROLLER_PORT = 19192, 19193
@@ -47,6 +47,9 @@ def test_start_status_round_trip_stop_and_reset(directory: Path) -> None:
     assert run(directory, "bootstrap").stdout == f"127.0.0.1:{PORT}\n"
 
     bootstrap = f"127.0.0.1:{PORT}"
+    # The broker never creates a topic on first use (auto.create.topics.enable=false in the script's config).
+    with pytest.raises(KafkaError):
+        produce(bootstrap, "not-created", [record.event for record in sessions(1)], flush_timeout_s=5)
     ensure_topic(bootstrap, "clickstream")
     events = [record.event for record in sessions(50)]
     produce(bootstrap, "clickstream", events)
