@@ -98,3 +98,21 @@ def test_the_largest_values_sum_exactly(event_type: str) -> None:
     expected = [Row(T0, event_type, 10_000, 10_000 * 10_000_000 * 99 if event_type == "purchase" else 0)]
     assert minute_aggregates(events) == expected
     assert duckdb_minute_aggregates(events) == expected
+
+
+@pytest.mark.parametrize("later_first", [False, True])
+def test_the_first_copy_in_input_order_counts_in_both_engines(later_first: bool) -> None:
+    # 200,000 ids sent twice, the copies in different windows; DuckDB aggregates this in parallel, so a copy picked by
+    # anything but input order would show. The review's test (tests/review/test_review_truth.py) has one order; both
+    # orders here, with the expected rows written out.
+    n = 200_000
+    early = make("page_view", event_time=T0)
+    late = make("page_view", event_time=T0 + 60_000)
+    ids = [f"00000000-0000-4000-8000-{i:012d}" for i in range(n)]
+    first, second = (late, early) if later_first else (early, late)
+    events = [dataclasses.replace(first, event_id=i) for i in ids] + [
+        dataclasses.replace(second, event_id=i) for i in ids
+    ]
+    expected = [Row(first.event_time, "page_view", n, 0)]
+    assert minute_aggregates(events) == expected
+    assert duckdb_minute_aggregates(events) == expected

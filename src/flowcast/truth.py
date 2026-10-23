@@ -1,8 +1,8 @@
 """Ground truth: the exact minute aggregates of a set of events, in Python and (the same definition) in DuckDB SQL.
 
 DESIGN.md "Ground truth". The generator made every event, so these are the answers the streaming job is checked
-against. Duplicates (the same event_id) count once; the generator's duplicates are the same bytes, so which copy
-counts doesn't matter.
+against. Duplicates (the same event_id) count once, as the first copy in input order: the generator's copies are the
+same bytes, but a file passed to `flowcast truth --input` may hold copies that differ, and both engines must agree.
 """
 
 from __future__ import annotations
@@ -80,10 +80,14 @@ def duckdb_minute_aggregates(events: Iterable[Event]) -> list[Row]:
                 out.write(encode(event) + b"\n")
         con = duckdb.connect()
         try:
+            # Insertion keeps the file's order (preserve_insertion_order, set here because the next step relies on
+            # it), so a row's rowid is its line number: the input order the SQL keeps the first copy by.
+            con.execute("SET preserve_insertion_order = true")
             con.execute(
-                "CREATE TABLE events AS SELECT * FROM read_json(?, format = 'newline_delimited', columns = ?)",
+                "CREATE TABLE wire AS SELECT * FROM read_json(?, format = 'newline_delimited', columns = ?)",
                 [str(path), DUCKDB_COLUMNS],
             )
+            con.execute("CREATE TABLE events AS SELECT rowid AS input_order, * FROM wire")
             rows = con.execute(minute_aggregates_sql()).fetchall()
         finally:
             con.close()
