@@ -284,3 +284,17 @@ def test_the_latest_start_is_accepted_and_a_stream_past_2100_stops_with_an_error
     with pytest.raises(OverflowError, match="2100-01-01"):
         for record in generator:
             encode(record.event)  # every record before the error is valid
+
+
+def test_an_event_at_exactly_2100_is_refused_too() -> None:
+    # The schema's limit is exclusive (event_time < 2100-01-01): the second review's mutant (>= to >) survived.
+    from flowcast.generator import _Session
+    from flowcast.schema import MAX_EVENT_TIME
+
+    generator = Generator(Config())
+    session = _Session("s0", generator._users[0], MAX_EVENT_TIME)
+    with pytest.raises(OverflowError, match="2100-01-01"):
+        generator._emit(session, "page_view", "/", None, None)
+    session.time_ms = MAX_EVENT_TIME - 1
+    generator._emit(session, "page_view", "/", None, None)
+    assert encode(generator._pending[0][2].event)

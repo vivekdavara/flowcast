@@ -47,10 +47,20 @@ def _admin(bootstrap: str) -> AdminClient:
     return AdminClient({"bootstrap.servers": bootstrap}, logger=_log)
 
 
-def wait_for_broker(bootstrap: str, timeout_s: float = 60.0) -> None:
-    """Return once the broker answers a metadata request; raise KafkaError after `timeout_s`."""
+def _check_timeout(timeout_s: float) -> None:
+    # NaN compares false with everything, so a NaN deadline never passes; infinity never does either.
     if not math.isfinite(timeout_s) or timeout_s < 0:
         raise ValueError("timeout_s must be a finite number of seconds, at least 0")
+
+
+def _left(deadline: float) -> float:
+    """Seconds to the deadline, at least 0.1 (a client call with a timeout of 0 doesn't wait for an answer)."""
+    return max(0.1, deadline - time.monotonic())
+
+
+def wait_for_broker(bootstrap: str, timeout_s: float = 60.0) -> None:
+    """Return once the broker answers a metadata request; raise KafkaError after `timeout_s`."""
+    _check_timeout(timeout_s)
     admin = _admin(bootstrap)
     deadline = time.monotonic() + timeout_s
     while True:
@@ -77,10 +87,11 @@ def ensure_topic(
     None means TOPIC_CONFIG; pass {} for the broker's defaults."""
     if not 1 <= partitions <= MAX_PARTITIONS:
         raise ValueError(f"partitions must be between 1 and {MAX_PARTITIONS}")
+    _check_timeout(timeout_s)
     admin = _admin(bootstrap)
     deadline = time.monotonic() + timeout_s
     created = False
-    if _served_partitions(admin, name, timeout_s) is None:
+    if _served_partitions(admin, name, _left(deadline)) is None:
         topic = NewTopic(
             name,
             num_partitions=partitions,
@@ -88,7 +99,8 @@ def ensure_topic(
             config=TOPIC_CONFIG if config is None else config,
         )
         try:
-            admin.create_topics([topic], operation_timeout=timeout_s, request_timeout=timeout_s)[name].result()
+            left = _left(deadline)
+            admin.create_topics([topic], operation_timeout=left, request_timeout=left)[name].result()
             created = True
         except KafkaException as exc:
             if exc.args[0].code() != RdKafkaError.TOPIC_ALREADY_EXISTS:
@@ -96,7 +108,7 @@ def ensure_topic(
             # Someone else created it between our check and our create: check it like any existing topic.
     # The controller has the topic once the create returns, but the broker's metadata (and its leadership of each
     # partition) can lag it: a racing creator's re-read, or a reader right after, could find no topic yet.
-    while (existing := _served_partitions(admin, name, timeout_s)) is None:
+    while (existing := _served_partitions(admin, name, _left(deadline))) is None:
         if time.monotonic() >= deadline:
             raise KafkaError(f"topic {name} isn't served by the broker after {timeout_s:g}s")
         time.sleep(_POLL_S)
@@ -106,6 +118,7 @@ def ensure_topic(
 
 
 def delete_topic(bootstrap: str, name: str, timeout_s: float = 30.0) -> None:
+    _check_timeout(timeout_s)
     admin = _admin(bootstrap)
     try:
         admin.delete_topics([name], operation_timeout=timeout_s, request_timeout=timeout_s)[name].result()
@@ -140,6 +153,7 @@ class Produced:
 def produce(bootstrap: str, topic: str, events: Iterable[Event], flush_timeout_s: float = 60.0) -> Produced:
     """Send each event as one record (key user_id, value its wire form), in order, and wait until every one is
     acknowledged. Raises KafkaError if any record wasn't delivered."""
+    _check_timeout(flush_timeout_s)
     producer = Producer(
         {
             **_client_config(bootstrap),
@@ -172,18 +186,31 @@ def produce(bootstrap: str, topic: str, events: Iterable[Event], flush_timeout_s
                     producer.poll(0.05)  # the local queue is full: serve delivery reports until there is room
             sent += 1
             producer.poll(0)
-    except BaseException:
+    except BaseException as exc:
         # The events failed part way (a bad event, an interrupt): deliver what was already sent before raising, so
-        # the topic holds a known prefix rather than whatever happened to leave the queue.
-        producer.flush(flush_timeout_s)
+        # the topic holds a prefix of the events rather than whatever happened to leave the queue. The flush is in
+        # short slices, so a second Ctrl-C ends it; and if some of the prefix wasn't delivered, the error says so.
+        left = _flush(producer, flush_timeout_s)
+        if failures or left:
+            exc.add_note(f"flowcast: of the {sent} records sent before this, {delivered} were acknowledged")
         raise
-    left = producer.flush(flush_timeout_s)
+    left = _flush(producer, flush_timeout_s)
     seconds = time.perf_counter() - started
     if failures:
         raise KafkaError(f"{len(failures)} of {sent} records failed; first: {failures[0]}")
     if left or delivered != sent:
         raise KafkaError(f"only {delivered} of {sent} records acknowledged within {flush_timeout_s:g}s")
     return Produced(sent, seconds)
+
+
+def _flush(producer: Producer, timeout_s: float) -> int:
+    """Producer.flush in slices of 0.1 s: one long call into librdkafka holds off Python's signal handling, so Ctrl-C
+    couldn't end it. Returns the records still not delivered."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        left = producer.flush(min(0.1, max(0.0, deadline - time.monotonic())))
+        if left == 0 or time.monotonic() >= deadline:
+            return left
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +228,7 @@ def read_topic(bootstrap: str, topic: str, timeout_s: float = 60.0) -> list[Reco
     No consumer group is joined and no offsets are committed: partitions are assigned directly and read to the end
     offsets taken at the start, so the read always ends and leaves nothing behind.
     """
+    _check_timeout(timeout_s)
     consumer = _reader(bootstrap)
     try:
         starts: dict[int, int] = {}
@@ -236,6 +264,7 @@ def read_topic(bootstrap: str, topic: str, timeout_s: float = 60.0) -> list[Reco
 def topic_counts(bootstrap: str, topic: str, timeout_s: float = 30.0) -> dict[int, int]:
     """Records in each partition now: high-water mark minus low (exact for this project's non-transactional writes,
     which put no control records in the log)."""
+    _check_timeout(timeout_s)
     consumer = _reader(bootstrap)
     try:
         return {p: high - low for p, (low, high) in _watermarks(consumer, topic, timeout_s).items()}
