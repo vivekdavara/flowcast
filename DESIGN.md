@@ -82,7 +82,7 @@ every hard case of streaming happen on purpose, at a known rate:
   think times between steps. A checkout is only reachable with a non-empty cart; a purchase writes one event per cart
   line.
 - **Disorder.** Each event's arrival time is its event time plus a small network delay (5 to 250 ms). A fraction
-  (`late_fraction`, 3%) arrive *late*: an extra exponential delay (mean 20 s, capped at 120 s), within any sensible
+  (`late_fraction`, 3%) arrive *late*: an extra exponential delay (mean 20 s, capped at 120 s), within the 3-minute
   watermark. A smaller fraction (`very_late_fraction`, 0.2%) arrive *very late*: 5 to 30 minutes, past the watermark,
   so a streaming aggregate must drop them and only the backfill sees them.
 - **Duplicates.** A fraction (`duplicate_fraction`, 1%) are sent twice: the copy has the same `event_id` and the same
@@ -114,13 +114,24 @@ The same aggregate is written once in SQL (`src/flowcast/sql/minute_aggregates.s
 events; a property test requires the Python and SQL answers to be equal for random generator settings. Day 2's Spark
 output is then checked against this truth:
 
-- Windows that no dropped event belongs to must match exactly.
-- A streaming aggregate with a watermark drops a row when its window has already closed: Spark's late-row filter for a
-  windowed aggregation compares the window's end with the watermark (`window.end <= watermark`), and the watermark is
-  the maximum event time of earlier micro-batches minus the delay. (This is my reading of Spark's
-  `WatermarkSupport.watermarkExpression`; day 2 confirms it with a test before relying on it.) Which late rows are
-  dropped depends on where the micro-batch boundaries fall, so the check is a bound: for every window, `spark ≤
-  truth`, and `Σ (truth − spark)` equals the rows Spark reports as dropped (`numRowsDroppedByWatermark`).
+- **Which rows Spark drops.** Read in Spark's source (`statefulOperators.scala` on master, `WatermarkSupport` and
+  the operators using it): streaming deduplication drops an input row whose event time is at or before the
+  late-events watermark; a windowed aggregation in append mode drops a row whose window ends at or before it. The
+  watermark is the maximum event time of earlier micro-batches minus the delay. The job dedupes before it windows,
+  and a row's window ends after its event time, so with one watermark the dedupe rule is the one that drops events.
+  (Day 2 confirms both rules with tests before relying on them, including which batch's watermark each operator uses.)
+- **The exact check.** Which records are dropped depends on where micro-batch boundaries fall, so the truth alone
+  gives only a bound (`spark ≤ truth` in every window). Each micro-batch's progress report says which Kafka offsets it
+  read and which watermark it used; replaying that over the records in Kafka gives exactly the records Spark had to
+  keep, and the truth of those must equal Spark's output, row for row.
+- **What the metric can and can't do.** `numRowsDroppedByWatermark` counts rows *at the operator*: input rows at
+  the dedupe (a very late event sent twice counts twice), but partial aggregates (one per window and key per batch)
+  at the window aggregation (five late events in one window can count once). So it's a cross-check of the dedupe's
+  input, against the replay's count of dropped records; it isn't an event count of the output.
+- **The watermark delay is 3 minutes**, above the late cap (2 minutes plus the network delay), so late records are
+  kept by design and very late ones (5 minutes or more) are dropped, except near the end of a finite stream: once the
+  last on-time events are in, the maximum event time stops moving, and very late records of the last 3 minutes arrive
+  above the watermark and are counted.
 - The batch backfill (day 3) reads every raw record, so its aggregates must equal the truth exactly, very late events
   included.
 
@@ -151,9 +162,9 @@ PySpark on Java 21, `local[*]`, reading Kafka with the `spark-sql-kafka-0-10` so
   goes to dead letters with its Kafka coordinates (topic, partition, offset), the raw bytes and the reason.
 - **Raw events**: every valid record, duplicates and very late ones included, with its Kafka partition, offset and
   timestamp, appended to Parquet partitioned by event date. No state, so nothing is ever dropped here.
-- **Minute aggregates**: a watermark on event time (2 minutes by default), `dropDuplicatesWithinWatermark("event_id")`,
-  then one-minute tumbling windows by event type: count and revenue. Output mode `append`, so a window is written once,
-  when the watermark passes its end. The price of that is latency: a window is at least window + delay + one trigger
+- **Minute aggregates**: a watermark on event time (3 minutes by default; see "Ground truth"),
+  `dropDuplicatesWithinWatermark("event_id")`, then one-minute tumbling windows by event type: count and revenue.
+  Output mode `append`, so a window is written once, when the watermark passes its end. The price of that is latency: a window is at least window + delay + one trigger
   old when it appears; day 4 measures it.
 - **Exactly once (day 3)**: the Kafka offsets of each micro-batch are in the checkpoint, and each sink must make a
   replayed batch harmless. Spark's file sink only records a batch's files in its `_spark_metadata` log once the batch

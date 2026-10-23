@@ -57,7 +57,7 @@ which C libraries needn't round identically, so I don't assume: a test pins the 
 and it passes on macOS and on Linux in CI.
 
 **What are the late, very late and duplicate records for?**
-Each one exercises a different part of the streaming job. Late (within 2 minutes) records must still land in the
+Each one exercises a different part of the streaming job. Late records (at most about 2 minutes) must still land in the
 right window: that's the watermark's job. Very late (5 to 30 minutes) records arrive after their window has closed:
 the streaming aggregate must drop them, and only the batch backfill (day 3) counts them. Duplicates are the same bytes
 sent again 0.1 to 5 s later, like a client that retried after a lost acknowledgement: the idempotent producer can't
@@ -82,11 +82,28 @@ on random streams. The SQL is the definition DuckDB will use over Spark's output
 of "the right answer" before any Spark code exists.
 
 **How will Spark's output be checked against it, when Spark drops late rows?**
-Windows that no dropped row belongs to must match exactly. For the rest it's a bound: Spark's windowed aggregation
-drops a row when its window's end is at or before the watermark (my reading of `WatermarkSupport` in Spark's source,
-to be confirmed by a test on day 2), and the watermark depends on micro-batch boundaries, so per window `spark ≤
-truth`, and the total shortfall must equal what Spark reports as `numRowsDroppedByWatermark`. The batch backfill
-reads every raw record, so it must equal the truth exactly.
+Exactly, not with a tolerance. Which late records Spark drops depends on where micro-batch boundaries fall, so the
+truth alone only bounds the output (`spark ≤ truth` per window). But each micro-batch's progress report says which
+Kafka offsets it read and which watermark it used, so replaying those over the records in Kafka says exactly which
+records Spark had to keep; the truth of those must equal Spark's output row for row. The batch backfill reads every
+raw record, so it must equal the full truth.
+
+**What does Spark drop, exactly?**
+From Spark's source (`WatermarkSupport` in `statefulOperators.scala`): streaming dedupe drops an input row whose event
+time is at or before the watermark; a windowed aggregation in append mode drops a row whose window ends at or before
+it. The job dedupes first, so the dedupe's rule is the one that drops events. Day 2 confirms both with tests.
+
+**Why not just reconcile with `numRowsDroppedByWatermark`?**
+I planned to, then read where it's counted: at each operator, on that operator's input. At the window aggregation
+that input is partial aggregates, one row per window and key per batch, so five late events in one window can count
+as one. The dedupe's count is in input rows, duplicates included, so it's a cross-check against the replay, not the
+check. That's a correction to my first design, found by reading the source before writing any Spark code.
+
+**Why a 3-minute watermark?**
+It's above the late records' cap (2 minutes plus network delay), so late records are kept by design and very late
+ones (5 minutes or more) are dropped. The exception is the end of a finite stream: once the last on-time events are
+in, the maximum event time stops moving, and very late records from the last 3 minutes arrive above the watermark and
+are counted. The replay check handles that without special cases.
 
 ## Kafka (day 1)
 
