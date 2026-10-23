@@ -114,8 +114,36 @@ first thing day 2's volume producer will look at.
   own: start twice, a round trip, data kept across a restart, reset; a busy port and a foreign directory refused.
 - `tests/test_cli.py`: each command's output and exit codes.
 
+- `tests/test_kafka_config.py`: the producer stays idempotent with `acks=all` (a fake producer, no broker); waits that
+  could never end are refused.
+- `tests/review/`: the day-1 review's findings as tests, each failing at the commit it reviewed (`943596b`).
+
 CI (`.github/workflows/ci.yml`): lint, types and every test against an `apache/kafka:4.3.1` service container; and
 `scripts/kafka.sh` against the Apache tarball (SHA-256 checked) on Java 21.
+
+## Review of day 1
+
+One review agent read the day's code at `943596b` (16:04 to 16:26) with a correctness brief, ran its own broker on
+other ports, and wrote each defect it reproduced as a failing test (10 tests in 6 files; one, the `product_id`
+length, was settled by changing DESIGN's table instead, so `tests/review/` keeps the other 9, in 5 files). All fixed:
+
+- **Python and DuckDB truths disagreed** when copies of an `event_id` differ: the SQL's `DISTINCT ON` had no order,
+  so with 200,000 ids sent twice DuckDB counted the later copies. Both now keep the first copy in input order.
+- **`ensure_topic` lost create races** (the broker's metadata lagged the controller: "has None partitions", 11 of 15
+  races of 6 threads), and **a topic just created couldn't always be read** ("Not leader for partition", 7 of 60).
+  `ensure_topic` now returns only once every partition has a leader; reads retry those settling errors.
+- **`kafka.sh` trusted any live pid** in its pid file, so after a crash or reboot `stop` could kill an unrelated
+  process that had been given the same pid. The pid's command line must now name this directory's config.
+- **`max_session_events` wasn't a cap** (a purchase writes one event per cart line); **a start near 2100 made invalid
+  events**; **`--wait nan` waited forever**; **a huge `--partitions` was a traceback**.
+
+Of its 12 surviving mutants, 10 are caught now, each run again here as a mutant against the fixed code (bare `u`/`s`/`p` ids, a 33-character category, reading and counting
+from a low watermark above 0, the producer's idempotence, the broker refusing auto-creation, the session cap, the
+quantity cap, the closed-pipe exit code, `--partitions 0`); two are still open: the snapshot reader's skip of records
+written after it started, and `delete_topic` swallowing errors. The test that a purchase empties the cart is new too:
+the review's mutant that bought only the first line was caught only by the slow property test, and now fails the
+10,000-session rules test as well. Its doubt about DESIGN's watermark accounting matched a correction already made from Spark's
+source (`26b835e`).
 
 ## Design decisions
 

@@ -141,6 +141,22 @@ KRaft node that advertises the runner's mapped port, `localhost:9192`. There's n
 check from inside the container can't reach the address it advertises; a step waits with the same `wait_for_broker`
 the tests use. A second job runs `scripts/kafka.sh` itself against the Apache tarball (SHA-256 checked) on Java 21.
 
+**What did the review find, and what was the worst of it?**
+Nine defects, each written as a failing test first (`tests/review/`). The one I'd lead with: my "same definition in
+two engines" truth wasn't. The SQL's `SELECT DISTINCT ON (event_id) *` had no `ORDER BY`, so DuckDB kept an arbitrary
+copy of a duplicated id; small inputs happened to agree because DuckDB ran them single-threaded, and my differential
+tests used the generator, whose duplicates are byte-identical. With 200,000 ids whose copies fall in different
+windows, the engines disagreed. Now both keep the first copy in input order (`input_order`, which for Kafka records is
+the offset, since a duplicate shares its original's partition). The lesson: a differential test only covers the
+inputs it's given, and mine couldn't produce the case that differs.
+
+**And the Kafka ones?**
+Two timing bugs a single broker still has: after a create, the broker's metadata and partition leadership lag the
+controller for a moment, so a racing creator saw "no topic" and a reader saw "Not leader for partition". The fix is to
+define "created" as "served": `ensure_topic` returns once every partition has a leader. And a safety bug in the
+script: a pid file outlives its process, and pids are reused, so `stop` now checks the process's command line names
+this directory's config before signalling it.
+
 **What would change in production?**
 Three or more brokers with replication factor 3 and `min.insync.replicas=2`; a schema registry instead of a
 version field; TLS and authentication; partitions sized to consumer parallelism and throughput rather than a laptop's
