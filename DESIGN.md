@@ -142,7 +142,9 @@ output is then checked against this truth:
 - **One broker in KRaft mode** (no ZooKeeper; Kafka 4 removed it), broker and controller in one process.
   Locally `scripts/kafka.sh` runs Homebrew's Kafka 4.3.1 on Java 21 with its config and data under `.kafka/` (ignored
   by git), broker on `127.0.0.1:9192`, controller on `127.0.0.1:9193` (the portfolio's port map), bound to loopback
-  only. CI runs the `apache/kafka` image of the same version as a service container.
+  only. It stops only its own broker: the pid in its pid file counts only if that process's command line names this
+  directory's config, since a pid file can outlive its process and pids are reused. CI runs the `apache/kafka` image
+  of the same version as a service container.
 - **The topic `clickstream`** has 6 partitions (one per laptop core Spark will use, and more than one so ordering
   across partitions is visibly not guaranteed) and replication factor 1 (one broker). Topics are created explicitly
   (`auto.create.topics.enable=false`), so a typo in a topic name is an error, not a new topic with the default
@@ -153,6 +155,10 @@ output is then checked against this truth:
 - **The producer is idempotent** (`enable.idempotence=true`, so `acks=all` and at most 5 in-flight requests): a
   retried send after a lost acknowledgement can't create a duplicate or reorder a partition. That covers the
   producer's own retries only; the generator's deliberate duplicates are separate sends and stay.
+- **Created means served.** Right after a create, the broker's metadata and its leadership of each partition lag
+  the controller for a moment: a racing creator can see no topic, and a reader can get "Not leader for partition".
+  `ensure_topic` returns only once the broker lists the topic with a leader for every partition, and readers retry
+  those two settling errors until their timeout.
 - **Reading a snapshot.** Tests and tools read a topic up to the high-water marks taken when they start (`read_topic`),
   so a read always ends, with no consumer group and no committed offsets left behind.
 
