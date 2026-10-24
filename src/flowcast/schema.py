@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import astuple, dataclass
+from dataclasses import dataclass
 from typing import Any, TypeGuard
 
 SCHEMA_VERSION = 1
@@ -64,6 +64,16 @@ class Event:
 FIELDS: tuple[str, ...] = tuple(Event.__dataclass_fields__)
 
 
+def values(event: Event) -> tuple[Any, ...]:
+    """The event's field values in FIELDS order. Not dataclasses.astuple, which copies recursively: it was more than
+    half of encode's time (scripts/measure_encode.py)."""
+    return tuple(getattr(event, name) for name in FIELDS)
+
+
+# Compact separators; one encoder made once rather than per call.
+_JSON = json.JSONEncoder(separators=(",", ":"))
+
+
 class InvalidEvent(ValueError):
     """A record that isn't a valid version-1 event; the message says why."""
 
@@ -71,7 +81,7 @@ class InvalidEvent(ValueError):
 def encode(event: Event) -> bytes:
     """The event's wire form: compact JSON, keys in FIELDS order, UTF-8. Checks the event first."""
     validate(event)
-    return json.dumps(dict(zip(FIELDS, astuple(event), strict=True)), separators=(",", ":")).encode()
+    return _JSON.encode({name: getattr(event, name) for name in FIELDS}).encode()
 
 
 def decode(value: bytes | None) -> Event:

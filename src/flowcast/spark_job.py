@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import os
 import sys
-from dataclasses import astuple, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 import pyspark
@@ -26,7 +26,7 @@ from pyspark.sql.types import IntegerType, LongType, StringType, StructField, St
 
 from flowcast.kafka_io import TOPIC
 from flowcast.layout import Paths
-from flowcast.schema import FIELDS, InvalidEvent, decode
+from flowcast.schema import FIELDS, InvalidEvent, decode, values
 
 WATERMARK_DELAY = "3 minutes"
 WATERMARK_DELAY_MS = 180_000
@@ -77,7 +77,7 @@ def _parse_value(value: bytes | bytearray | None) -> tuple[object, ...]:
         event = decode(None if value is None else bytes(value))
     except InvalidEvent as exc:
         return (str(exc),) + (None,) * len(FIELDS)
-    return (None, *astuple(event))
+    return (None, *values(event))
 
 
 _parse_udf = F.udf(_parse_value, PARSED_SCHEMA, useArrow=True)
