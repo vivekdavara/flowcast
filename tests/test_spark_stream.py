@@ -77,6 +77,7 @@ def test_the_job_writes_exactly_what_the_replay_of_its_batches_says(spark: Any, 
     result = replay(in_kafka, batches, topic)
     assert len(batches) >= len(in_kafka) // 150
     assert result.unread == 0 and result.invalid == len(BAD)
+    assert result.watermark_errors == []  # the job ran with the specified 3-minute delay
     assert len(result.dropped) > 10, "the late rule was exercised"
 
     written = sorted(

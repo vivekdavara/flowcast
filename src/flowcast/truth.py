@@ -18,6 +18,8 @@ import duckdb
 from flowcast.schema import Event, encode
 
 WINDOW_MS = 60_000
+# The streaming job's watermark delay: above the generator's late cap, below its very late minimum (DESIGN.md).
+WATERMARK_DELAY_MS = 180_000
 
 # DuckDB column types for the version-1 fields, so read_json never guesses (a column of nulls would become JSON).
 DUCKDB_COLUMNS = {

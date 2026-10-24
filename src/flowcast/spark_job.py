@@ -27,9 +27,9 @@ from pyspark.sql.types import IntegerType, LongType, StringType, StructField, St
 from flowcast.kafka_io import TOPIC
 from flowcast.layout import Paths
 from flowcast.schema import FIELDS, InvalidEvent, decode, values
+from flowcast.truth import WATERMARK_DELAY_MS
 
-WATERMARK_DELAY = "3 minutes"
-WATERMARK_DELAY_MS = 180_000
+WATERMARK_DELAY = f"{WATERMARK_DELAY_MS // 1000} seconds"
 # The stateful operators' state is split into this many partitions. It is fixed for the life of a checkpoint, and
 # Spark's default (200) means 200 state stores per operator per batch, far too many for a laptop.
 STATE_PARTITIONS = 6

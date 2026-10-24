@@ -19,7 +19,7 @@ from typing import Any
 
 from flowcast.kafka_io import Record
 from flowcast.schema import Event, InvalidEvent, decode
-from flowcast.truth import WINDOW_MS, Row, minute_aggregates
+from flowcast.truth import WATERMARK_DELAY_MS, WINDOW_MS, Row, minute_aggregates
 
 
 @dataclass(frozen=True)
@@ -70,10 +70,17 @@ class Replay:
     invalid: int  # records `decode` refuses (the job's dead letters)
     unread: int  # records past the last committed batch's end offsets
     watermark_ms: int  # the last committed batch's watermark: windows ending at or before it are written
+    # Batches whose recorded watermark isn't the one the records before them give: the latest event time of every
+    # valid record read in earlier batches minus the delay, never moving back. Empty when the job ran as specified.
+    watermark_errors: list[str]
 
 
-def replay(records: Iterable[Record], batches: Sequence[Batch], topic: str) -> Replay:
-    """Assign each record to the batch that read it, and keep it or drop it as the stream did."""
+def replay(
+    records: Iterable[Record], batches: Sequence[Batch], topic: str, delay_ms: int = WATERMARK_DELAY_MS
+) -> Replay:
+    """Assign each record to the batch that read it, and keep it or drop it as the stream did. Each batch's watermark
+    is also recomputed from the records before it with `delay_ms`, so a job run with another delay is caught (the
+    drop rule alone takes the watermark from the checkpoint, whatever it was)."""
     by_partition: dict[int, list[Record]] = {}
     for record in sorted(records, key=lambda r: (r.partition, r.offset)):
         by_partition.setdefault(record.partition, []).append(record)
@@ -82,7 +89,14 @@ def replay(records: Iterable[Record], batches: Sequence[Batch], topic: str) -> R
     dropped: list[Event] = []
     invalid = 0
     late_watermark = 0  # batch 0 runs with no earlier watermark
+    latest_event: int | None = None  # a running maximum, so the watermark it gives never moves back, as Spark's
+    watermark_errors: list[str] = []
     for batch in batches:
+        expected_watermark = 0 if latest_event is None else latest_event - delay_ms
+        if batch.watermark_ms != expected_watermark:
+            watermark_errors.append(
+                f"batch {batch.batch_id}: watermark {batch.watermark_ms}, expected {expected_watermark}"
+            )
         ends = kafka_end_offsets(batch, topic)
         for partition, partition_records in sorted(by_partition.items()):
             end = ends.get(partition, 0)
@@ -94,11 +108,13 @@ def replay(records: Iterable[Record], batches: Sequence[Batch], topic: str) -> R
                     invalid += 1
                 else:
                     (dropped if event.event_time <= late_watermark else kept).append(event)
+                    latest_event = event.event_time if latest_event is None else max(latest_event, event.event_time)
                 i += 1
             position[partition] = i
         late_watermark = batch.watermark_ms
     unread = sum(len(rs) - position[p] for p, rs in by_partition.items())
-    return Replay(kept, dropped, invalid, unread, batches[-1].watermark_ms if batches else 0)
+    last_watermark = batches[-1].watermark_ms if batches else 0
+    return Replay(kept, dropped, invalid, unread, last_watermark, watermark_errors)
 
 
 def expected_rows(result: Replay) -> list[Row]:
@@ -122,6 +138,7 @@ class Report:
     def ok(self) -> bool:
         return (
             self.written == self.expected
+            and not self.replay.watermark_errors
             and self.raw_events[0] == self.raw_events[1]
             and self.dead_letters[0] == self.dead_letters[1]
         )
@@ -137,6 +154,8 @@ class Report:
             + ("equal" if self.written == self.expected else f"{len(missing)} missing, {len(extra)} unexpected"),
             *(f"  missing    {row}" for row in missing[:10]),
             *(f"  unexpected {row}" for row in extra[:10]),
+            f"  watermarks: {len(r.watermark_errors)} batches differ from the records' ({WATERMARK_DELAY_MS} ms delay)",
+            *(f"  {problem}" for problem in r.watermark_errors[:10]),
             f"raw_events: {self.raw_events[0]} written, {self.raw_events[1]} valid records read",
             f"dead_letters: {self.dead_letters[0]} written, {self.dead_letters[1]} invalid records read",
             "ok" if self.ok else "MISMATCH",
