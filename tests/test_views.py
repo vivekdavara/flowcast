@@ -4,7 +4,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from flowcast.views import COLUMNS, SinkLogError, committed_files, connect
+from flowcast.views import COLUMNS, SinkLogError, committed_files, connect, latest_batch
 
 
 def log_file(sink: Path, name: str, entries: list[tuple[Path | str, str]], version: str = "v1") -> None:
@@ -105,5 +105,48 @@ def test_a_view_reads_the_logged_files_and_not_a_stray_one(tmp_path: Path) -> No
     con = connect(tmp_path)
     try:
         assert con.execute("SELECT * FROM minute_aggregates").fetchall() == [(0, "page_view", 3, 0)]
+    finally:
+        con.close()
+
+
+def test_a_numberless_file_name_is_refused(tmp_path: Path) -> None:
+    log_file(tmp_path, "0", [])
+    log_file(tmp_path, "abc", [])
+    with pytest.raises(SinkLogError, match="not a sink log file"):
+        committed_files(tmp_path)
+
+
+def test_the_latest_batch_counts_compact_files(tmp_path: Path) -> None:
+    assert latest_batch(tmp_path) == -1
+    log_file(tmp_path, "9.compact", [])
+    assert latest_batch(tmp_path) == 9  # Spark writes 9.compact instead of 9 at a compaction batch
+    log_file(tmp_path, "10", [])
+    assert latest_batch(tmp_path) == 10
+
+
+def test_only_the_newest_compact_file_and_the_batches_after_it_are_read(tmp_path: Path) -> None:
+    old, new, stale, last = (tmp_path / f"{n}.parquet" for n in ("old", "new", "stale", "last"))
+    log_file(tmp_path, "9.compact", [(old, "add")])
+    log_file(tmp_path, "19.compact", [(new, "add")])
+    log_file(tmp_path, "19", [(stale, "add")])  # a batch file beside its own compact file: the compact one rules
+    log_file(tmp_path, "20", [(last, "add")])
+    assert committed_files(tmp_path) == sorted([new, last])
+
+
+def test_a_quote_in_a_path_is_escaped_in_the_view(tmp_path: Path) -> None:
+    root = tmp_path / "Vivek's runs"
+    sink = root / "minute_aggregates"
+    file = sink / "part-0.parquet"
+    sink.mkdir(parents=True)
+    with duckdb.connect() as con:
+        con.execute(
+            "COPY (SELECT 0::BIGINT AS window_start, 'checkout' AS event_type, 1::BIGINT AS events, "
+            "0::BIGINT AS revenue_cents) TO ?",
+            [str(file)],
+        )
+    log_file(sink, "0", [(file, "add")])
+    con = connect(root)
+    try:
+        assert con.execute("SELECT event_type FROM minute_aggregates").fetchall() == [("checkout",)]
     finally:
         con.close()

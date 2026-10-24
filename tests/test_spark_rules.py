@@ -58,6 +58,7 @@ def run(
         .start()
     )
     query.awaitTermination()
+    run.last_progress = query.lastProgress  # type: ignore[attr-defined]
     rows = spark.table(name).collect()
     spark.catalog.dropTempView(name)
     watermarks = [b.watermark_ms for b in committed_batches(tmp_path / "checkpoint")]
@@ -117,7 +118,8 @@ def test_in_the_job_the_dedupe_is_the_rule_that_drops(spark: Any, tmp_path: Path
 
     batches = [
         [event(T0, "a")],
-        [event(T0 - 190_000, "x", "purchase") | {"price_cents": 250, "quantity": 3}],  # kept, window ends on W1
+        # x: kept, its window ends on W1; v: a page view in the same window, which brings no revenue.
+        [event(T0 - 190_000, "x", "purchase") | {"price_cents": 250, "quantity": 3}, event(T0 - 185_000, "v")],
         [event(T0, "a"), event(W1, "y")],  # a again: a duplicate; y: at the dedupe's late watermark, dropped
         [event(T0 + 60_000)],
         [event(T0 + 60_000)],
@@ -125,6 +127,23 @@ def test_in_the_job_the_dedupe_is_the_rule_that_drops(spark: Any, tmp_path: Path
     rows, watermarks = run(spark, tmp_path, batches, minute_aggregates)
     assert watermarks == [0, W1, W1, W1, W1 + 60_000]
     # x's window is written with its revenue; y's window (W1 to W1 + 1 min) has nothing in it, so it isn't written.
-    assert [(r.window_start, r.event_type, r.events, r.revenue_cents) for r in rows] == [
-        (W1 - 60_000, "purchase", 1, 750)
+    assert sorted((r.window_start, r.event_type, r.events, r.revenue_cents) for r in rows) == [
+        (W1 - 60_000, "page_view", 1, 0),
+        (W1 - 60_000, "purchase", 1, 750),
     ]
+
+
+@pytest.mark.usefixtures("no_data_batches_off")
+def test_the_dedupe_forgets_an_event_id_once_the_watermark_passes_its_time_plus_the_delay(
+    spark: Any, tmp_path: Path
+) -> None:
+    """dropDuplicatesWithinWatermark keeps an event_id only until the watermark passes its event time plus the delay,
+    so its state is bounded; dropDuplicates on event_id alone would keep every id forever (the review's surviving
+    mutant: the output is the same, only the state differs)."""
+    from flowcast.spark_job import deduplicated
+
+    batches = [[event(T0, "a")], [event(T0 + 400_000, "f")], [event(T0 + 400_001, "g")]]
+    rows, watermarks = run(spark, tmp_path, batches, deduplicated)
+    assert watermarks == [0, W1, T0 + 220_000]  # batch 2's watermark passes a's T0 + 3 min
+    assert sorted(r.event_id for r in rows) == ["a", "f", "g"]
+    assert run.last_progress["stateOperators"][0]["numRowsTotal"] == 2  # type: ignore[attr-defined]  # f and g
