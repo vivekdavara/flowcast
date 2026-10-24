@@ -95,13 +95,19 @@ def committed_files(sink: Path) -> list[Path]:
     return sorted(live)
 
 
-def _view_sql(name: str, files: list[Path], *, hive: bool) -> str:
+def _view_sql(name: str, files: list[Path], *, date_partition: str | None = None) -> str:
+    """The view over `files`. Spark keeps a partition column (`date_partition`) only in the directory name, so it is
+    read from each file's own parent directory: DuckDB's hive_partitioning would take every key=value segment of
+    the whole absolute path, and a run under ".../trigger=5/" would gain a `trigger` column (day-2 review)."""
     if not files:
         columns = ", ".join(f"NULL::{kind} AS {column}" for column, kind in COLUMNS[name].items())
         return f"CREATE OR REPLACE VIEW {name} AS SELECT {columns} WHERE false"
     listed = ", ".join("'" + str(f).replace("'", "''") + "'" for f in files)
-    source = f"read_parquet([{listed}], hive_partitioning = {str(hive).lower()})"
-    return f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM {source}"
+    if date_partition is None:
+        return f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM read_parquet([{listed}])"
+    date = f"CAST(regexp_extract(filename, '/{date_partition}=([^/]+)/[^/]+$', 1) AS DATE) AS {date_partition}"
+    source = f"read_parquet([{listed}], hive_partitioning = false, filename = true)"
+    return f"CREATE OR REPLACE VIEW {name} AS SELECT * EXCLUDE (filename), {date} FROM {source}"
 
 
 def connect(root: Path, database: str = ":memory:") -> duckdb.DuckDBPyConnection:
@@ -109,9 +115,9 @@ def connect(root: Path, database: str = ":memory:") -> duckdb.DuckDBPyConnection
     paths = Paths(root)
     con = duckdb.connect(database)
     try:
-        con.execute(_view_sql("raw_events", committed_files(paths.raw_events), hive=True))
-        con.execute(_view_sql("minute_aggregates", committed_files(paths.minute_aggregates), hive=False))
-        con.execute(_view_sql("dead_letters", committed_files(paths.dead_letters), hive=False))
+        con.execute(_view_sql("raw_events", committed_files(paths.raw_events), date_partition="event_date"))
+        con.execute(_view_sql("minute_aggregates", committed_files(paths.minute_aggregates)))
+        con.execute(_view_sql("dead_letters", committed_files(paths.dead_letters)))
     except BaseException:
         con.close()
         raise
