@@ -10,7 +10,9 @@ readme = "README.md"
 license = "MIT"
 authors = [{ name = "Vivek Davara" }]
 requires-python = ">=3.11"
-dependencies = ["confluent-kafka>=2.16", "duckdb>=2.0"]
+# PySpark is pinned: the Kafka source jar it fetches (spark_job.KAFKA_PACKAGE) must be the same version. Its Arrow
+# Python UDFs need pandas and pyarrow.
+dependencies = ["confluent-kafka>=2.16", "duckdb>=2.0", "pyspark==4.2.0", "pandas>=2.2,<3", "pyarrow>=18"]
 
 [project.optional-dependencies]
 dev = ["pytest>=9", "pytest-cov>=6", "hypothesis>=6.150", "ruff==0.17.2", "mypy>=2.4"]
@@ -27,7 +29,10 @@ flowcast = ["py.typed", "sql/*.sql"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-markers = ["kafka: needs a Kafka broker at FLOWCAST_TEST_BOOTSTRAP (skipped without one)"]
+markers = [
+    "kafka: needs a Kafka broker at FLOWCAST_TEST_BOOTSTRAP (skipped without one)",
+    "spark: starts a local Spark session (needs Java 21)",
+]
 
 [tool.coverage.run]
 source = ["flowcast"]

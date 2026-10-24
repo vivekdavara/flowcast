@@ -1,6 +1,10 @@
 PY := .venv/bin/python
 # The Kafka tests need a broker; `make kafka-start` runs the local one this points at (CI sets its own).
 export FLOWCAST_TEST_BOOTSTRAP ?= 127.0.0.1:9192
+# Spark 4 runs on Java 17 or 21; the Mac's default java is 23, so point Spark at Homebrew's 21 when it's there.
+ifneq ($(wildcard /opt/homebrew/opt/openjdk@21),)
+export JAVA_HOME ?= /opt/homebrew/opt/openjdk@21
+endif
 
 .PHONY: venv lint test check coverage kafka-start kafka-stop
 
