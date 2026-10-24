@@ -65,6 +65,10 @@ def session(app: str = "flowcast", master: str = "local[*]", *, kafka: bool = Tr
         # Parquet's standard timestamp (UTC microseconds) rather than Spark's legacy INT96 default.
         .config("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS")
         .config("spark.ui.enabled", "false")
+        # Local mode needs only loopback: no lookup of the machine's hostname (which can fail to resolve after a
+        # network change, and then the driver can't bind), and nothing listening on other interfaces.
+        .config("spark.driver.bindAddress", "127.0.0.1")
+        .config("spark.driver.host", "127.0.0.1")
     )
     if kafka:
         builder = builder.config("spark.jars.packages", KAFKA_PACKAGE)

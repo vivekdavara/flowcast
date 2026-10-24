@@ -128,7 +128,7 @@ def test_the_cli_runs_the_job_checks_it_and_queries_it(topic: str, tmp_path: Pat
 
     stream = [*cli, "stream", *kafka, "--out", str(out), "--available-now", "--max-offsets", "200"]
     done = subprocess.run(stream, capture_output=True, text=True, timeout=300)
-    assert done.returncode == 0, done.stderr[-3000:]
+    assert done.returncode == 0, done.stderr[-8000:]
     check = subprocess.run([*cli, "check", *kafka, "--out", str(out)], capture_output=True, text=True, timeout=120)
     assert check.returncode == 0, check.stdout + check.stderr
     assert check.stdout.splitlines()[-1] == "ok"
