@@ -12,6 +12,7 @@ batch backfill) and the tests share one definition of "valid", "dedupe" and "win
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from dataclasses import astuple, dataclass
@@ -169,25 +170,30 @@ class Queries:
     def all(self) -> tuple[StreamingQuery, ...]:
         return (self.dead_letters, self.raw_events, self.minute_aggregates)
 
-    def process_all_available(self) -> None:
+    def await_termination(self) -> None:
         for query in self.all():
-            query.processAllAvailable()
+            query.awaitTermination()
 
     def stop(self) -> None:
         for query in self.all():
             query.stop()
 
 
-def kafka_records(spark: SparkSession, bootstrap: str, topic: str = TOPIC) -> DataFrame:
-    """The topic as a stream, from the earliest offset; a gap in the offsets (data deleted under the job) fails it."""
-    return (
+def kafka_records(
+    spark: SparkSession, bootstrap: str, topic: str = TOPIC, *, max_offsets_per_trigger: int | None = None
+) -> DataFrame:
+    """The topic as a stream, from the earliest offset; a gap in the offsets (data deleted under the job) fails it.
+    `max_offsets_per_trigger` caps a batch's records (spread over the partitions), so a backlog is read in steps."""
+    reader = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", bootstrap)
         .option("subscribe", topic)
         .option("startingOffsets", "earliest")
         .option("failOnDataLoss", "true")
-        .load()
     )
+    if max_offsets_per_trigger is not None:
+        reader = reader.option("maxOffsetsPerTrigger", str(max_offsets_per_trigger))
+    return reader.load()
 
 
 def start(
@@ -196,11 +202,18 @@ def start(
     paths: Paths,
     *,
     trigger_s: float = 5.0,
+    available_now: bool = False,
     delay: str = WATERMARK_DELAY,
 ) -> Queries:
-    """Start the three queries over `records` (a Kafka stream, or anything with its columns), writing under `paths`."""
+    """Start the three queries over `records` (a Kafka stream, or anything with its columns), writing under `paths`.
+
+    A batch starts every `trigger_s` seconds (at once if the last one took longer). With `available_now`, the queries
+    instead read what is there when they start, in as many batches as the offset cap makes, and then stop.
+    """
+    if not math.isfinite(trigger_s) or trigger_s < 0:
+        raise ValueError("trigger_s must be a finite number of seconds, at least 0")
+    interval = f"{round(trigger_s * 1000)} milliseconds"
     parsed = parse(records)
-    trigger = f"{trigger_s:g} seconds"
 
     def sink(frame: DataFrame, name: str, out: Path, partition_by: tuple[str, ...] = ()) -> StreamingQuery:
         writer = (
@@ -209,8 +222,8 @@ def start(
             .option("path", str(out))
             .option("checkpointLocation", str(paths.checkpoint(name)))
             .outputMode("append")
-            .trigger(processingTime=trigger)
         )
+        writer = writer.trigger(availableNow=True) if available_now else writer.trigger(processingTime=interval)
         if partition_by:
             writer = writer.partitionBy(*partition_by)
         return writer.start()
