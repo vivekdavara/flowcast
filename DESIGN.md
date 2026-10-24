@@ -116,16 +116,26 @@ The same aggregate is written once in SQL (`src/flowcast/sql/minute_aggregates.s
 events; a property test requires the Python and SQL answers to be equal for random generator settings. Day 2's Spark
 output is then checked against this truth:
 
-- **Which rows Spark drops.** Read in Spark's source (`statefulOperators.scala` on master, `WatermarkSupport` and
-  the operators using it): streaming deduplication drops an input row whose event time is at or before the
-  late-events watermark; a windowed aggregation in append mode drops a row whose window ends at or before it. The
-  watermark is the maximum event time of earlier micro-batches minus the delay. The job dedupes before it windows,
-  and a row's window ends after its event time, so with one watermark the dedupe rule is the one that drops events.
-  (Day 2 confirms both rules with tests before relying on them, including which batch's watermark each operator uses.)
-- **The exact check.** Which records are dropped depends on where micro-batch boundaries fall, so the truth alone
-  gives only a bound (`spark ≤ truth` in every window). Each micro-batch's progress report says which Kafka offsets it
-  read and which watermark it used; replaying that over the records in Kafka gives exactly the records Spark had to
-  keep, and the truth of those must equal Spark's output, row for row.
+- **Which rows Spark drops** (confirmed on day 2). Streaming deduplication drops an input row whose event time is at
+  or before the late-events watermark; a windowed aggregation in append mode drops a row whose window ends at or
+  before it. Since Spark 3.4 a query may chain stateful operators, and the late-events watermark of every operator in
+  batch *i* is **batch *i - 1*'s watermark**, not batch *i*'s own (`PropagateWatermarkSimulator` in
+  `WatermarkPropagator.scala`, Spark 4.2.0: "We use watermark for previous microbatch to determine late events"); the
+  batch's own watermark only decides what state to evict and which windows to write. A batch's watermark is the
+  maximum event time of the batches before it minus the delay. `tests/test_spark_rules.py` feeds a file stream one
+  file per batch with no-data batches off and confirms all of it on the job's own functions: a row below batch 1's
+  watermark but read in batch 1 is kept (batch 0 had none), a row exactly on batch 1's watermark read in batch 2 is
+  dropped, and chained, the window aggregate never drops a row the dedupe kept, so **the dedupe is the rule that
+  drops events**.
+- **The exact check** (`check.py`). Which records are dropped depends on where micro-batch boundaries fall, so the
+  truth alone gives only a bound (`spark ≤ truth` in every window). A query's checkpoint keeps, for every batch, an
+  offset-log entry (`offsets/<id>`: the Kafka end offsets it read up to, and `batchWatermarkMs`) and, once its output is
+  done, a commit (`commits/<id>`); no-data batches (which only move the watermark) are entries too. Replaying the
+  committed batches over the records in Kafka assigns each record to the batch that read it and drops a valid one
+  whose event time is at or before the previous batch's watermark. The truth of the kept records, in the windows whose
+  end is at or before the last batch's watermark, must equal Spark's output row for row. Spark deletes offset-log
+  entries beyond `spark.sql.streaming.minBatchesToRetain` (100 by default), so the job raises it to 100,000, and the
+  replay refuses a checkpoint that doesn't start at batch 0.
 - **What the metric can and can't do.** `numRowsDroppedByWatermark` counts rows *at the operator*: input rows at
   the dedupe (a very late event sent twice counts twice), but partial aggregates (one per window and key per batch)
   at the window aggregation (five late events in one window can count once). So it's a cross-check of the dedupe's
@@ -164,16 +174,29 @@ output is then checked against this truth:
 
 ## Spark (days 2 and 3)
 
-PySpark on Java 21, `local[*]`, reading Kafka with the `spark-sql-kafka-0-10` source. One streaming query per output:
+PySpark 4.2 on Java 21, `local[*]`, reading Kafka with the `spark-sql-kafka-0-10` source (the same version, fetched
+from Maven Central on first use). One streaming query per output, each with its own checkpoint; the transformations are
+plain functions in `spark_job.py`, shared by the stream, the tests and day 3's backfill:
 
-- **Parse and validate**: `from_json` with the version-1 schema, then the same rules as `decode`; a record that fails
-  goes to dead letters with its Kafka coordinates (topic, partition, offset), the raw bytes and the reason.
+- **Parse and validate** (`parse`): `schema.decode` itself, in an Arrow Python UDF, gives each record's verdict and
+  reason; a record that fails goes to dead letters with its Kafka coordinates (topic, partition, offset, timestamp),
+  the raw bytes and the reason. `from_json` was the obvious alternative and can't give the same verdicts: tried on
+  `{"a":1,"a":2,"z":5,"e":NaN}` it keeps the last of the two `a`s, ignores the unknown `z` and reads `NaN` as a
+  number, where `decode` refuses all three. One definition of "valid" costs a Python call per record; day 4 measures
+  it. A reason is made valid UTF-8 before it leaves the UDF (a quoted key can be a lone surrogate, which Arrow can't
+  encode, and the throw would fail the whole query: the day-2 review).
 - **Raw events**: every valid record, duplicates and very late ones included, with its Kafka partition, offset and
   timestamp, appended to Parquet partitioned by event date. No state, so nothing is ever dropped here.
 - **Minute aggregates**: a watermark on event time (3 minutes by default; see "Ground truth"),
-  `dropDuplicatesWithinWatermark("event_id")`, then one-minute tumbling windows by event type: count and revenue.
-  Output mode `append`, so a window is written once, when the watermark passes its end. The price of that is latency: a window is at least window + delay + one trigger
-  old when it appears; day 4 measures it.
+  `dropDuplicatesWithinWatermark("event_id")` (its state for an id is dropped once the watermark passes the id's event
+  time plus the delay, so state stays bounded, unlike `dropDuplicates`), then one-minute tumbling windows by event type:
+  count and revenue. Output mode `append`, so a window is written once, when the watermark passes its end. The price
+  of that is latency: a window is at least window + delay + one trigger old when it appears; day 4 measures it.
+- **Settings**: 6 shuffle partitions (the state stores per stateful operator, fixed for a checkpoint's life; Spark's
+  200 is far too many for a laptop), UTC session time, Parquet's standard UTC-microsecond timestamps (not INT96), the
+  driver bound to 127.0.0.1 (otherwise it binds to the Wi-Fi address, since the Mac's hostname resolves to loopback).
+  `flowcast stream` runs continuously (`--trigger` seconds) or `--available-now` (read what the topic holds, in as
+  many batches as `--max-offsets` makes, then stop cleanly).
 - **Exactly once (day 3)**: the Kafka offsets of each micro-batch are in the checkpoint, and each sink must make a
   replayed batch harmless. Spark's file sink only records a batch's files in its `_spark_metadata` log once the batch
   commits, so a reader that globs the directory can see files from a batch that failed; readers use the log (or the
@@ -185,9 +208,24 @@ PySpark on Java 21, `local[*]`, reading Kafka with the `spark-sql-kafka-0-10` so
 
 ## DuckDB
 
-DuckDB reads the Parquet outputs through views (`raw_events`, `minute_aggregates`, `dead_letters`), so a query never
-needs to know the directory layout. It is also the oracle in tests: the SQL for an aggregate is run over generated
-events and compared with the Python truth (day 1) and with Spark's output (days 2 and 3).
+DuckDB reads the Parquet outputs through views (`raw_events`, `minute_aggregates`, `dead_letters`; `views.py`), so a
+query never needs to know the directory layout. A Spark file sink writes a batch's files first and lists them in its
+`_spark_metadata` log when the batch commits, so the directory can hold files of a batch that failed: the views read
+the log (the latest `.compact` file plus the batch files after it, with its add and delete entries), never a glob. The
+file list is taken when the view is made. `event_date`, which Spark keeps only in the directory name, is read from
+each file's own parent directory (DuckDB's hive partitioning would read every `key=value` segment of the absolute
+path). DuckDB is also the oracle in tests: the truth's SQL runs over generated events (day 1) and over the raw events
+Spark wrote (day 2, equal to the truth of every event).
+
+## The producer (day 2)
+
+`produce` sends each event keyed by `user_id` with an idempotent producer and returns only once every record is
+acknowledged: records, bytes, seconds and the acknowledged count per partition (which tests compare with the topic's
+offsets). `ProducerSettings` sets librdkafka's `linger.ms`, `batch.size` and `compression.type` (checked against its
+limits; idempotence can't be turned off). `pacing.Pacer` replays the generator's arrival times against the wall clock
+at a chosen speed (1 = real time) and reports how far it fell behind; without it the producer is a backlog test. The
+first cost was encoding: `dataclasses.astuple` was more than half of it, and plain attribute reads made `encode` 2.8x
+faster with the same bytes.
 
 ## Measurement (day 4)
 

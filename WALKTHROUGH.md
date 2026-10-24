@@ -161,3 +161,82 @@ this directory's config before signalling it.
 Three or more brokers with replication factor 3 and `min.insync.replicas=2`; a schema registry instead of a
 version field; TLS and authentication; partitions sized to consumer parallelism and throughput rather than a laptop's
 cores; and the producer embedded in the collector service rather than replaying a generator.
+
+## The Spark job (day 2)
+
+Reading order for day 2: DESIGN.md "Ground truth" (the drop rule and the exact check), "Spark", "DuckDB", "The
+producer" → `src/flowcast/spark_job.py` (`parse`, `deduplicated`, `window_counts`, `start`) →
+`tests/test_spark_rules.py` → `src/flowcast/check.py` (`committed_batches`, `replay`, `check_run`) →
+`src/flowcast/views.py` (`committed_files`, `_view_sql`) → `tests/test_spark_stream.py` → `src/flowcast/pacing.py`.
+
+**Walk me through the job.**
+Three streaming queries over the Kafka topic, one per output, each with its own checkpoint (`start`). All three run the
+same `parse`: each record becomes `schema.decode`'s verdict plus the event's fields and the record's coordinates.
+Invalid records go to `dead_letters` (bytes, coordinates, reason); valid ones go to `raw_events`, partitioned by event
+date, with no state, so nothing is ever dropped there. The third query sets a 3-minute watermark on event time, drops
+duplicate `event_id`s within it, and counts one-minute windows by event type in append mode, so each window is written
+once, when the watermark passes its end. All three are Parquet file sinks.
+
+**Why validate in a Python UDF? That's slow.**
+Because there should be one definition of "valid", and `from_json` isn't it. I tried it: on `{"a":1,"a":2,"z":5,
+"e":NaN}` it keeps the last `a`, ignores the unknown `z`, and reads `NaN` as a number, all things `decode` refuses on
+purpose. Matching `decode` in Spark SQL would mean re-implementing duplicate-key and token-level checks that
+`from_json` doesn't expose. So `parse` calls `decode` in an Arrow UDF, and `test_spark_parse.py` holds it to
+`decode`'s exact verdict and reason on 170 records (150 generated, 20 bad). The cost is a Python call per record,
+which day 4 measures; if it matters, the fallback is native checks for the common path with the UDF only for what they
+can't decide.
+
+**How do you know the streaming output is right?**
+`check.py` replays the job's own batches. Each query's checkpoint has an offset-log entry per batch, holding the Kafka
+end offsets it read up to and the watermark it ran with, and a commit once the batch's output is done. Replaying the
+committed batches over the records actually in Kafka tells me which batch read each record, and so whether the stream
+had to drop it. The truth of the kept records, in the windows the last watermark has passed, must equal what Spark
+wrote, row for row. It also recomputes every batch's watermark from the records before it, so a job run with the wrong
+delay fails (the review showed that was missing). `flowcast check` does this for any stopped run. On the demo run
+(39,346 records, 21 batches) it kept 39,291, dropped 55 as late, and the 48 written rows matched exactly.
+
+**Which watermark decides that a row is late? How did you find out?**
+The previous batch's. Spark 3.4+ lets a query chain stateful operators, and to keep a downstream operator from
+dropping rows an upstream one just emitted, every operator's late-event filter uses batch *i - 1*'s watermark; batch
+*i*'s own watermark only decides eviction and which windows to write. I read it in `WatermarkPropagator.scala`
+(`PropagateWatermarkSimulator.getInputWatermarkForLateEvents` returns `getInputWatermark(batchId - 1, ...)`), then
+confirmed it with `test_spark_rules.py`: a file source with one file per batch and no-data batches off, so every
+batch boundary and watermark is known. A row below batch 1's watermark but read in batch 1 is kept; a row exactly on it
+read in batch 2 is dropped (so the comparison is "at or before"). Chained, the window aggregate never drops a row the
+dedupe kept, so the dedupe is the one rule the replay needs.
+
+**Why does the replay need a test that a `<` instead of `<=` fails?**
+Because the end-to-end test can't see it: generated event times almost never land exactly on a watermark. That mutant
+survives `test_spark_stream.py` and dies in `test_check.py`'s hand-made case. Using the current batch's watermark
+instead fails the end-to-end test.
+
+**Why do the DuckDB views read `_spark_metadata` instead of globbing the directory?**
+Because a file sink writes a batch's Parquet files before it commits the batch in that log. After a failure the
+directory can hold files of a batch that will be written again, and a glob would count them twice. `committed_files`
+reads the log the way Spark writes it: the newest `.compact` file plus the batch files after it, applying adds and
+deletes. A test puts a stray file next to a logged one and the view doesn't see it.
+
+**What did the review find?**
+Four defects, each a failing test first (`tests/review_d2/`). The worst: **one bad record could stop the whole job**.
+`decode`'s reason can quote a key, a JSON escape can make that key a lone surrogate (`{"\ud800":1,"\ud800":2}`),
+Arrow can't encode that as UTF-8, and the UDF's exception failed the task and the query, the opposite of what dead
+letters are for. Reasons are now escaped to valid UTF-8. The others: `flowcast stream` gave a traceback on a failed
+query (its own error report was unreachable), DuckDB errors escaped `main`, and `raw_events` picked up extra columns
+from `key=value` segments in the run directory's path. Its surviving mutants got tests too, all re-run and killed;
+the notable one, `dropDuplicates` instead of `dropDuplicatesWithinWatermark`, gives the same output with state that
+never shrinks, so only a state-size check catches it.
+
+**What's the producer's pacing for?**
+Sending as fast as possible is a backlog test (70,670 records/s here, generation and encoding included). A live
+stream is the generator's arrival times replayed against the wall clock (`Pacer`, with a speed factor), and that's
+what end-to-end latency on day 4 needs. On the way, the first cost turned out to be `dataclasses.astuple` in `encode`,
+not JSON: plain attribute reads made `encode` 2.8x faster with identical bytes, which the pinned hash enforces.
+
+**Tell me about a mistake from day 2.**
+Two. One test hung for ten minutes, and I almost blamed Spark. The cause was my test: it called
+`AdminClient(...).delete_records(...)` on a temporary client, which was freed straight away, and its futures never
+resolve after that. The fix was to keep the client and bound the wait. The other was a wrong commit message: a test
+run failed while a review agent was killing processes, and I blamed a driver bind failure, because the tail of the
+log said "bind to another address". That was only Spark's warning that it had picked the Wi-Fi address. The change
+(bind the driver to loopback) was still right, for a different reason, and the next commit's message corrects the
+record.

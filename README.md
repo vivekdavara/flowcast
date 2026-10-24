@@ -13,7 +13,7 @@ result can be checked against it.
 | Day | What | State |
 |---|---|---|
 | 1 | Design, event schema, generator, ground truth, local Kafka, round trip, CI | done |
-| 2 | Producer at volume; the Spark job (validate, dead letters, raw events, windowed aggregates); DuckDB views | |
+| 2 | Producer at volume; the Spark job (validate, dead letters, raw events, windowed aggregates); DuckDB views; the exact check | done |
 | 3 | Exactly-once across restarts; late data; schema version 2; batch backfill | |
 | 4 | Benchmarks (throughput, end-to-end latency, trigger intervals); data-quality checks | |
 | 5 | Static HTML report, results, walkthrough, v1.0.0 | |
@@ -28,13 +28,16 @@ flowchart LR
   G["generator<br/>seeded, arrival order"] --> P["producer<br/>idempotent, key = user_id"]
   G -.-> T["ground truth<br/>Python + DuckDB SQL"]
   P --> K[("Kafka: clickstream<br/>6 partitions, KRaft")]
-  K --> S["Spark Structured Streaming<br/>(day 2)"]
+  K --> S["Spark Structured Streaming<br/>3 queries, one checkpoint each"]
   S --> PQ["Parquet<br/>raw, aggregates, dead letters"]
-  PQ --> D["DuckDB views"]
-  T -.->|"tests compare"| D
+  PQ --> D["DuckDB views<br/>(from the sinks' logs)"]
+  S -.->|"checkpoints: offsets + watermark per batch"| C["flowcast check<br/>replay vs truth"]
+  T -.-> C
+  D -.-> C
 ```
 
-Built so far (day 1): everything left of Kafka, Kafka itself, and the round trip through it.
+Built so far (days 1 and 2): the whole pipeline, and an exact check of its output. Day 3 adds exactly-once across a
+killed job, schema version 2 and the batch backfill.
 
 ## Layout
 
@@ -44,16 +47,23 @@ src/flowcast/
   generator.py            sessions, arrival order, late records, duplicates, determinism
   truth.py                exact minute aggregates in Python and DuckDB
   sql/minute_aggregates.sql
-  kafka_io.py             topic creation, idempotent producer, snapshot reader, partition counts
-  cli.py                  flowcast generate | truth | topic | produce | count | version
+  kafka_io.py             topic creation, idempotent producer (settings, accounting), snapshot reader, counts
+  pacing.py               replays arrival times against the wall clock
+  spark_job.py            the job: parse (decode in a UDF), dead letters, raw events, dedupe, windows, start
+  layout.py               where a run writes (an output and a checkpoint per query)
+  check.py                the replay of a run's batches over Kafka, and the report
+  views.py                DuckDB views from the file sinks' logs
+  cli.py                  flowcast generate | truth | topic | produce | count | stream | check | query | version
 scripts/kafka.sh          local single-node Kafka (start/stop/status/bootstrap/logs/reset)
-scripts/measure_generator.py
-tests/                    unit, property, differential and Kafka integration tests
+scripts/measure_generator.py, scripts/measure_encode.py
+tests/                    unit, property, differential, Kafka and Spark tests
 ```
 
 ## How to run
 
-Needs Python 3.11 and, for Kafka, Homebrew's `kafka` (4.3.1) and `openjdk@21`.
+Needs Python 3.11 and, for Kafka and Spark, Homebrew's `kafka` (4.3.1) and `openjdk@21` (the Makefile points
+`JAVA_HOME` at it). PySpark 4.2.0 comes with `make venv`; its Kafka source jars are fetched from Maven Central on first
+use (into `~/.ivy2.5.2`).
 
 ```bash
 make venv
@@ -61,8 +71,8 @@ make kafka-start
 make check
 ```
 
-`make check` runs ruff, ruff format, mypy --strict and the tests, Kafka ones included (they use their own topics and
-delete them). `make kafka-stop` stops the broker; `scripts/kafka.sh reset` deletes its data.
+`make check` runs ruff, ruff format, mypy --strict and the tests, Kafka and Spark ones included (they use their own
+topics and delete them; about two minutes). `make kafka-stop` stops the broker; `scripts/kafka.sh reset` deletes its data.
 
 Try the pieces:
 
@@ -73,6 +83,20 @@ Try the pieces:
 .venv/bin/flowcast produce --sessions 1000
 .venv/bin/flowcast count
 ```
+
+Run the job and check it:
+
+```bash
+.venv/bin/flowcast topic --topic demo
+.venv/bin/flowcast produce --topic demo --sessions 10000
+.venv/bin/flowcast stream --topic demo --out data/demo --available-now --max-offsets 2000
+.venv/bin/flowcast check --topic demo --out data/demo
+.venv/bin/flowcast query --out data/demo "SELECT * FROM minute_aggregates ORDER BY window_start LIMIT 10"
+```
+
+`stream` without `--available-now` runs until Ctrl-C, a batch every `--trigger` seconds (5); `produce --speed 1`
+paces records by their arrival times (real time; 10 is ten times faster), and `--linger-ms`, `--batch-bytes` and
+`--compression` set the producer's batching.
 
 `generate --sessions N` writes every record of N whole sessions (very late ones included); `--records N` is the first
 N records of the endless stream, which is what a collector would have received by then. Both take `--seed` and the
@@ -99,6 +123,22 @@ records; the gap in generation speed isn't separated between the code (an event-
 the load. These numbers size day 2's producer runs; the encode cost (the strict checks run on every record) is the
 first thing day 2's volume producer will look at.
 
+## Results (day 2)
+
+Synthetic data. Apple M3, macOS 26.6.2, Python 3.11.12, PySpark 4.2.0 on Java 21.0.12; on AC power from 16:30 (the
+battery at 22-42%, charging), with Vivek's own apps open (load average 8 to 17 during the runs).
+
+| What | Result | Command |
+|---|---|---|
+| The exact check of a run | 39,346 records (10,000 sessions, default settings) read in **21 batches**: 39,291 kept, **55 dropped as late**, 0 invalid; **48 aggregate rows written, 48 expected: equal**; every batch's watermark as recomputed from the records; 39,346 raw events for 39,346 valid records read | the "Run the job and check it" commands above, at `f26b685`, topic `demo-d2`, `--max-offsets 2000` |
+| That run's length | 46 s for `stream --available-now` (Spark's start included; three queries) | same |
+| `encode` | **277,755 events/s**, from 101,924 at `e2f0a30` (2.8x; `dataclasses.astuple` was 180,914/s alone); same bytes | `.venv/bin/python scripts/measure_encode.py` (79,390 events, best of 7 interleaved rounds); on battery with a review agent running: 100,530 to 278,420 |
+| `produce`, unpaced | 39,346 records (11.4 MB) in 0.56 s: **70,670 records/s**, generating and encoding included; acknowledgements by partition match the topic | `.venv/bin/flowcast produce --topic demo-d2 --sessions 10000` (one run) |
+| `produce --speed 50` | 2,000 sessions (8,029 records) in 36.75 s, at most 6 ms behind schedule: the very late tail (up to 30 minutes of arrival time) sets the length | `.venv/bin/flowcast produce --sessions 2000 --speed 50` (one run, on battery) |
+
+What these aren't: day 4's benchmarks. The job's throughput, the cost of the parse UDF and end-to-end latency are
+measured there, on an idle machine.
+
 ## Tests
 
 - `tests/test_schema.py`: every rule of the field table refuses a bad value with its reason; JSON edge cases
@@ -120,8 +160,23 @@ first thing day 2's volume producer will look at.
   could never end are refused.
 - `tests/review/` and `tests/review2/`: the two day-1 reviews' findings as tests, each failing at the commit it
   reviewed (`943596b`, `a403362`).
+- `tests/test_spark_rules.py` (Spark): the late-row rules on the job's own functions, one file per batch: the previous
+  batch's watermark, inclusive, for the dedupe and the windows; the dedupe's state is evicted; revenue only for
+  purchases.
+- `tests/test_spark_parse.py` (Spark): `parse` gives `decode`'s verdict and reason on 170 records (150 generated, 20
+  bad); the dead letter and raw event split, columns and dates.
+- `tests/test_spark_stream.py` (Kafka and Spark): 300 thin sessions (20% late, 5% very late, 5% duplicates) and four bad
+  records through two runs of the job at 150 records a batch; the aggregates must equal the replay row for row, with
+  watermarks as specified and more than 10 records dropped; raw events and dead letters reconcile; the DuckDB views
+  match; the truth's SQL over the raw events equals the Python truth. Then the CLI: `stream`, `check`, `query` as
+  subprocesses, and a forged aggregate row that `check` must reject.
+- `tests/test_check.py`: the replay and `check_run` on hand-made checkpoints and run directories (no Spark, no broker).
+- `tests/test_views.py`: reading the sink log (compaction, deletes, gaps, strangers, URIs) and the views.
+- `tests/test_pacing.py`: the pacer on a fake clock.
+- `tests/review_d2/`: the day-2 review's findings, each failing at `0eb546a`.
 
-CI (`.github/workflows/ci.yml`): lint, types and every test against an `apache/kafka:4.3.1` service container; and
+CI (`.github/workflows/ci.yml`): lint, types and every test (Spark on Temurin 21, its jars cached) against an
+`apache/kafka:4.3.1` service container; and
 `scripts/kafka.sh` against the Apache tarball (SHA-256 checked) on Java 21.
 
 ## Review of day 1
@@ -157,6 +212,32 @@ librdkafka, which holds off Python's signal handling, so a second Ctrl-C couldn'
 now. From its suspicions: every Kafka call refuses NaN or infinite timeouts, `ensure_topic`'s calls share one
 deadline, and a prefix that wasn't all delivered says so on the error. No third review this time.
 
+## Review of day 2
+
+One review agent read the day's code at `0eb546a` (15:34 to 15:47, its own worktree and broker on other ports, a
+correctness brief) and wrote four defects as failing tests (`tests/review_d2/`, 5 tests in 3 files); each failed here
+before its fix and passes after:
+
+- **One bad record could stop the job.** `decode`'s reason can quote a key; a JSON escape can make that key a lone
+  surrogate (`{"\ud800":1,"\ud800":2}`), which Arrow can't encode, so the UDF threw, the task failed, and the query
+  with it. Reasons are escaped to valid UTF-8 now (`29332c3`).
+- `flowcast stream` gave a traceback when a query failed (its own report was unreachable), and DuckDB errors escaped
+  `query` and `check` (`84b19c0`). The stream test needed a new trigger once the first fix landed: records deleted from
+  Kafka before the job read them, which `failOnDataLoss` makes a failure.
+- `raw_events` took columns from every `key=value` segment of the run directory's path (`83c8007`).
+
+It ran 38 mutants and listed 16 as surviving (or not run against every test). 14 are killed now, each re-run here
+as a mutant against the new tests: 7 in check.py and 5 in views.py (`.scratch/mut_check.py`, `mut_views.py`), and in
+spark_job.py `_revenue`'s `lit(1)` and `dropDuplicates` for `dropDuplicatesWithinWatermark` (against
+`test_spark_rules.py`). The latter gives the same output with state that never shrinks, so a test checks the state
+size (`f26b685`). The most important one, **a job run with a 2-minute watermark passed every test**: the replay now
+recomputes every batch's watermark from the records and the report fails on a difference (`52f2023`), unit-tested
+with 2- and 4-minute checkpoints and required by the end-to-end test; the job mutant itself wasn't re-run. The 16th,
+`hive=False`, no longer exists after `83c8007`. Two of my own new mutants survived at first: one was an equivalent
+`max()` (removed), the other got a test. Its suspicions, noted in the limitations: copies of an event_id that differ
+(outside the spec) could make `check` report a correct job as wrong; `check` on a running job can race a commit.
+It also said that its `pkill -f` had killed a process of my test run (see `b5b6b09` and `29332c3`'s messages).
+
 ## Design decisions
 
 - **Integer cents and integer milliseconds**, so Python, DuckDB and Spark compute identical answers, compared with `==`.
@@ -169,19 +250,28 @@ deadline, and a prefix that wasn't all delivered says so on the error. No third 
 - **Key = `user_id`**: a user's events stay in one partition, in order. **Idempotent producer**: the producer's own
   retries can't duplicate or reorder; the generator's duplicates stay, and the pipeline must remove them.
 - **Topics are never auto-created**, and an existing topic with the wrong partition count is refused.
+- **Validation is `decode` itself**, in an Arrow UDF: `from_json` keeps the last of two duplicate keys, ignores
+  unknown keys and reads `NaN`, so it can't give the same verdicts. One definition of valid, at a Python call per record.
+- **The check replays the job's own batches** (checkpoint offsets and watermarks) instead of trusting a metric: the
+  stream's output must equal the truth of the records it had to keep, exactly.
+- **Views read the sinks' logs**, never a glob: files of a failed batch are never seen.
+- **Spark on loopback**, UTC, 6 state partitions, standard Parquet timestamps.
 - **`kafka.sh` stops only its own pid** (`kafka-server-stop` would signal every broker on the machine), binds to
   loopback, and deletes only a directory it made.
 
-## Limitations (day 1)
+## Limitations (day 2)
 
-- Nothing reads the topic yet except the tests: the Spark job is day 2.
-- The generator is single-threaded Python; `produce` sends as fast as it can, with no pacing by arrival time (day 2).
+- Three queries each read Kafka and run the parse UDF: three times the reading and parsing of one query with a shared
+  source (day 4 measures the cost; `foreachBatch` into three sinks would trade it for doing exactly-once by hand).
+- Exactly-once across a killed job isn't tested yet (day 3), and `flowcast check` must run on a stopped job: on a live
+  one a batch can commit between its reads. It compares raw events and dead letters by count, not record by record.
+- The check assumes copies of an event_id are identical, as the generator makes them; copies that differ (outside the
+  spec, though `decode` accepts them) could make it report a correct job as wrong.
 - Event-time skew between devices isn't modelled: each event's time is its true time, and lateness is all in transit.
-- One broker, replication factor 1: this is a laptop pipeline, not a fault-tolerant cluster.
+- One broker, replication factor 1, Spark in local mode: a laptop pipeline, not a fault-tolerant cluster.
 - `read_topic` gives up on any consumer error rather than retrying transient ones, and can't finish a compacted or
   transactional topic (it reads to the high-water mark). Untested still: its skip of records written after the
-  snapshot, and `delete_topic` swallowing errors. A topic deleted in the middle of a create race is reported as "not
-  served" after the full timeout.
+  snapshot, and `delete_topic` swallowing errors.
 
 ## License
 
