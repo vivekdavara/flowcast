@@ -80,8 +80,15 @@ def _parse_value(value: bytes | bytearray | None) -> tuple[object, ...]:
     try:
         event = decode(None if value is None else bytes(value))
     except InvalidEvent as exc:
-        return (str(exc),) + (None,) * len(FIELDS)
+        return (safe_reason(exc),) + (None,) * len(FIELDS)
     return (None, *values(event))
+
+
+def safe_reason(exc: InvalidEvent) -> str:
+    """decode's reason, with anything that isn't valid UTF-8 backslash-escaped. A reason can quote a key, and JSON's
+    escapes can make a key holding a lone surrogate ("\\ud800"), which Arrow can't encode: the UDF would throw, failing
+    the task and with it the whole query, over one bad record that belongs in dead letters (day-2 review)."""
+    return str(exc).encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 _parse_udf = F.udf(_parse_value, PARSED_SCHEMA, useArrow=True)

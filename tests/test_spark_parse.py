@@ -8,6 +8,7 @@ import pytest
 
 from flowcast.generator import sessions
 from flowcast.schema import FIELDS, InvalidEvent, decode, encode
+from flowcast.spark_job import safe_reason
 from tests.test_schema import make, raw
 
 pytestmark = pytest.mark.spark
@@ -36,6 +37,8 @@ def records() -> list[bytes | None]:
         encode(make())[:-1] + b',"quantity":3}',  # a duplicate key: from_json would keep the last
         encode(make()).replace(b'"price_cents":1999', b'"price_cents":NaN'),
         encode(make()).replace(b'"quantity":2', b'"quantity":true'),
+        b'{"\\ud800":1,"\\ud800":2}',  # the reason quotes a key that is a lone surrogate (day-2 review)
+        encode(make())[:-1] + b',"\\udfff":1}',
     ]
     return good + bad
 
@@ -44,7 +47,7 @@ def verdict(value: bytes | None) -> tuple[Any, ...]:
     try:
         return (None, *dataclasses.astuple(decode(value)))
     except InvalidEvent as exc:
-        return (str(exc), *(None,) * len(FIELDS))
+        return (safe_reason(exc), *(None,) * len(FIELDS))
 
 
 def test_parse_gives_decodes_verdict_and_reason_for_every_record(spark: Any) -> None:
@@ -58,7 +61,8 @@ def test_parse_gives_decodes_verdict_and_reason_for_every_record(spark: Any) -> 
     for row, value in zip(rows, values, strict=True):
         assert tuple(row[name] for name in ("error", *FIELDS)) == verdict(value), value
         assert (row.value is None and value is None) or bytes(row.value) == value
-    assert sum(r.error is not None for r in rows) == 18
+    assert sum(r.error is not None for r in rows) == 20
+    assert rows[-2].error == "duplicate field \\ud800"
 
 
 def test_dead_letters_and_raw_events_split_the_records(spark: Any) -> None:
