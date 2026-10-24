@@ -227,7 +227,8 @@ before its fix and passes after:
 - `raw_events` took columns from every `key=value` segment of the run directory's path (`83c8007`).
 
 It ran 38 mutants and listed 16 as surviving (or not run against every test). 14 are killed now, each re-run here
-as a mutant against the new tests: 7 in check.py and 5 in views.py (`.scratch/mut_check.py`, `mut_views.py`), and in
+as a mutant against the new tests: 7 in check.py and 5 in views.py (a throwaway script, not committed, applied each mutant, ran the tests and
+restored the file from a copy), and in
 spark_job.py `_revenue`'s `lit(1)` and `dropDuplicates` for `dropDuplicatesWithinWatermark` (against
 `test_spark_rules.py`). The latter gives the same output with state that never shrinks, so a test checks the state
 size (`f26b685`). The most important one, **a job run with a 2-minute watermark passed every test**: the replay now
