@@ -14,7 +14,7 @@ from urllib.parse import unquote, urlparse
 
 import duckdb
 
-from flowcast.spark_job import Paths
+from flowcast.layout import Paths
 from flowcast.truth import DUCKDB_COLUMNS
 
 KAFKA_COLUMNS = {"topic": "VARCHAR", "partition": "INTEGER", "offset": "BIGINT", "kafka_timestamp": "TIMESTAMPTZ"}
@@ -35,16 +35,8 @@ class SinkLogError(Exception):
     pass
 
 
-def committed_files(sink: Path) -> list[Path]:
-    """The data files of every committed batch of a Spark file sink, from its `_spark_metadata` log, sorted.
-
-    The log has one file per batch (`<id>`), and every `compactInterval` batches a `<id>.compact` holding all entries
-    up to it, after which Spark may delete the older files: the latest compact file plus the batch files after it is
-    the whole log. Each file is `v1` then one JSON entry per line, with the file's URI and action (add or delete).
-    """
-    log = sink / "_spark_metadata"
-    if not log.is_dir():
-        return []
+def _log_files(log: Path) -> tuple[dict[int, Path], dict[int, Path]]:
+    """The sink log's batch files and compact files, by batch id."""
     batches: dict[int, Path] = {}
     compacts: dict[int, Path] = {}
     for path in log.iterdir():
@@ -55,6 +47,29 @@ def committed_files(sink: Path) -> list[Path]:
         if not stem.isdigit() or suffix not in ("", "compact"):
             raise SinkLogError(f"{path}: not a sink log file")
         (compacts if suffix else batches)[int(stem)] = path
+    return batches, compacts
+
+
+def latest_batch(sink: Path) -> int:
+    """The id of the last batch in a file sink's log (it logs every batch, empty ones too); -1 for none."""
+    log = sink / "_spark_metadata"
+    if not log.is_dir():
+        return -1
+    batches, compacts = _log_files(log)
+    return max([*batches, *compacts], default=-1)
+
+
+def committed_files(sink: Path) -> list[Path]:
+    """The data files of every committed batch of a Spark file sink, from its `_spark_metadata` log, sorted.
+
+    The log has one file per batch (`<id>`), and every `compactInterval` batches a `<id>.compact` holding all entries
+    up to it, after which Spark may delete the older files: the latest compact file plus the batch files after it is
+    the whole log. Each file is `v1` then one JSON entry per line, with the file's URI and action (add or delete).
+    """
+    log = sink / "_spark_metadata"
+    if not log.is_dir():
+        return []
+    batches, compacts = _log_files(log)
     start = max(compacts, default=-1)
     after = sorted(i for i in batches if i > start)
     if after != list(range(start + 1, start + 1 + len(after))):
@@ -90,7 +105,7 @@ def _view_sql(name: str, files: list[Path], *, hive: bool) -> str:
 
 
 def connect(root: Path, database: str = ":memory:") -> duckdb.DuckDBPyConnection:
-    """A DuckDB connection with the three views over the job's outputs under `root` (spark_job.Paths)."""
+    """A DuckDB connection with the three views over the job's outputs under `root` (layout.Paths)."""
     paths = Paths(root)
     con = duckdb.connect(database)
     try:

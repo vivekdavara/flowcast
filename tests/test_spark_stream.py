@@ -1,12 +1,16 @@
 """The whole job through a real broker, checked exactly: the minute aggregates it wrote must be the truth of the records
 its own batches had to keep (check.py), and every record must come out as a raw event or a dead letter."""
 
+import json
 import os
+import subprocess
+import sys
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import pytest
 from confluent_kafka import Producer
 
@@ -49,14 +53,15 @@ def produce_raw(topic: str, values: list[bytes]) -> None:
 
 def run(spark: Any, topic: str, out: Path) -> None:
     """One run of the job over what's in the topic now, 150 records a batch, resuming from its checkpoints."""
-    from flowcast.spark_job import Paths, kafka_records, start
+    from flowcast.layout import Paths
+    from flowcast.spark_job import kafka_records, start
 
     records = kafka_records(spark, BOOTSTRAP, topic, max_offsets_per_trigger=150)
     start(spark, records, Paths(out), available_now=True).await_termination()
 
 
 def test_the_job_writes_exactly_what_the_replay_of_its_batches_says(spark: Any, topic: str, tmp_path: Path) -> None:
-    from flowcast.spark_job import Paths
+    from flowcast.layout import Paths
 
     events = [r.event for r in sessions(300, CONFIG)]
     half = len(events) // 2
@@ -112,3 +117,36 @@ def test_the_job_writes_exactly_what_the_replay_of_its_batches_says(spark: Any, 
         assert truth_sql == minute_aggregates(events)
     finally:
         con.close()
+
+
+def test_the_cli_runs_the_job_checks_it_and_queries_it(topic: str, tmp_path: Path) -> None:
+    events = [r.event for r in sessions(120, CONFIG)]
+    produce(BOOTSTRAP, topic, events)
+    out = tmp_path / "run"
+    cli = [sys.executable, "-m", "flowcast.cli"]
+    kafka = ["--bootstrap", BOOTSTRAP, "--topic", topic]
+
+    stream = [*cli, "stream", *kafka, "--out", str(out), "--available-now", "--max-offsets", "200"]
+    done = subprocess.run(stream, capture_output=True, text=True, timeout=300)
+    assert done.returncode == 0, done.stderr[-3000:]
+    check = subprocess.run([*cli, "check", *kafka, "--out", str(out)], capture_output=True, text=True, timeout=120)
+    assert check.returncode == 0, check.stdout + check.stderr
+    assert check.stdout.splitlines()[-1] == "ok"
+    assert f"raw_events: {len(events)} written, {len(events)} valid records read" in check.stdout
+    query = [*cli, "query", "--out", str(out), "SELECT count(*) AS n, sum(events) > 0 AS any FROM raw_events, ("]
+    assert subprocess.run(query, capture_output=True, text=True).returncode == 1  # bad SQL: exit 1
+    query[-1] = "SELECT count(*) AS n FROM raw_events"
+    assert subprocess.run(query, capture_output=True, text=True).stdout == f"n\n{len(events)}\n"
+
+    # An aggregate row the replay doesn't explain, committed in the sink's log as Spark would: the check must fail.
+    sink = out / "minute_aggregates"
+    forged = sink / "part-forged.parquet"
+    row = "SELECT 0::BIGINT AS window_start, 'page_view' AS event_type, 1::BIGINT AS events, 0::BIGINT AS revenue_cents"
+    with duckdb.connect() as con:
+        con.execute(f"COPY ({row}) TO '{forged}'")
+    last = max((p for p in (sink / "_spark_metadata").iterdir() if p.name.isdigit()), key=lambda p: int(p.name))
+    entry = {"path": forged.as_uri(), "size": forged.stat().st_size, "isDir": False, "action": "add"}
+    last.write_text(last.read_text().rstrip("\n") + "\n" + json.dumps(entry))
+    check = subprocess.run([*cli, "check", *kafka, "--out", str(out)], capture_output=True, text=True, timeout=120)
+    assert check.returncode == 1
+    assert "1 unexpected" in check.stdout and "MISMATCH" in check.stdout

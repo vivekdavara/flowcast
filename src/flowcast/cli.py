@@ -15,7 +15,10 @@ from datetime import UTC, datetime
 from itertools import islice
 from pathlib import Path
 
+import duckdb
+
 from flowcast import __version__
+from flowcast.check import CheckpointError, check_run
 from flowcast.generator import Config, Emitted, Generator
 from flowcast.kafka_io import (
     DEFAULT_BOOTSTRAP,
@@ -30,10 +33,17 @@ from flowcast.kafka_io import (
 )
 from flowcast.schema import Event, InvalidEvent, decode, encode
 from flowcast.truth import duckdb_minute_aggregates, minute_aggregates
+from flowcast.views import SinkLogError, connect
+
+DEFAULT_OUT = Path("data/run")
 
 
 class UsageError(Exception):
     pass
+
+
+class StreamFailed(Exception):
+    """The job or a check of it failed; the message says how."""
 
 
 def _positive(text: str) -> int:
@@ -100,6 +110,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     count = sub.add_parser("count", help="records in each partition of a topic")
     _kafka_options(count)
+
+    stream = sub.add_parser("stream", help="run the Spark job from the topic to Parquet under --out (Ctrl-C stops it)")
+    _kafka_options(stream)
+    stream.add_argument("--out", type=Path, default=DEFAULT_OUT, help="output directory (default %(default)s)")
+    stream.add_argument("--trigger", type=_seconds, default=5.0, help="seconds between batches (default %(default)s)")
+    stream.add_argument("--max-offsets", type=_positive, help="at most this many records a batch")
+    stream.add_argument("--available-now", action="store_true", help="read what the topic holds now, then stop")
+
+    check = sub.add_parser("check", help="check a stopped run's outputs exactly against the records in the topic")
+    _kafka_options(check)
+    check.add_argument("--out", type=Path, default=DEFAULT_OUT, help="the run's directory (default %(default)s)")
+
+    query = sub.add_parser("query", help="run SQL over a run's DuckDB views and print CSV")
+    query.add_argument("sql", help="e.g. 'SELECT * FROM minute_aggregates ORDER BY window_start LIMIT 10'")
+    query.add_argument("--out", type=Path, default=DEFAULT_OUT, help="the run's directory (default %(default)s)")
     return parser
 
 
@@ -172,6 +197,57 @@ def _produce(args: argparse.Namespace) -> None:
     print(f"produced {produced.records} records to {args.topic} in {produced.seconds:.2f} s")
 
 
+def _stream(args: argparse.Namespace) -> None:
+    if args.max_offsets == 0:
+        raise UsageError("--max-offsets must be at least 1")
+    wait_for_broker(args.bootstrap, timeout_s=args.wait)
+    topic_counts(args.bootstrap, args.topic)  # the topic must exist: the job doesn't create it
+    # Imported here: starting Spark takes seconds and needs Java, which no other command does.
+    from flowcast.layout import Paths
+    from flowcast.spark_job import kafka_records, session, start
+
+    spark = session()
+    spark.sparkContext.setLogLevel("WARN")
+    try:
+        records = kafka_records(spark, args.bootstrap, args.topic, max_offsets_per_trigger=args.max_offsets)
+        queries = start(spark, records, Paths(args.out), trigger_s=args.trigger, available_now=args.available_now)
+        try:
+            if args.available_now:
+                queries.await_termination()
+            else:
+                print(f"streaming {args.topic} to {args.out} every {args.trigger:g} s; Ctrl-C stops", file=sys.stderr)
+                spark.streams.awaitAnyTermination()  # returns or raises only if a query ends by itself (a failure)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            queries.stop()
+        failed = [q.name for q in queries.all() if q.exception() is not None]
+        if failed:
+            raise StreamFailed(f"queries failed: {', '.join(failed)} (see the log above)")
+    finally:
+        spark.stop()
+
+
+def _check(args: argparse.Namespace) -> None:
+    report = check_run(args.bootstrap, args.topic, args.out, timeout_s=args.wait)
+    print("\n".join(report.lines()))
+    if not report.ok:
+        raise StreamFailed("the outputs don't match the replay of the job's batches")
+
+
+def _query(args: argparse.Namespace) -> None:
+    con = connect(args.out)
+    try:
+        result = con.execute(args.sql)
+        writer = csv.writer(sys.stdout, lineterminator="\n")
+        writer.writerow([column[0] for column in result.description or []])
+        writer.writerows(result.fetchall())
+    except duckdb.Error as exc:
+        raise StreamFailed(f"query failed: {exc}") from exc
+    finally:
+        con.close()
+
+
 def _count(args: argparse.Namespace) -> None:
     wait_for_broker(args.bootstrap, timeout_s=args.wait)
     counts = topic_counts(args.bootstrap, args.topic)
@@ -188,6 +264,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "topic": _topic,
         "produce": _produce,
         "count": _count,
+        "stream": _stream,
+        "check": _check,
+        "query": _query,
     }
     if args.command == "version":
         print(f"flowcast {__version__}")
@@ -202,7 +281,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except UsageError as exc:
         print(f"flowcast {args.command}: {exc}", file=sys.stderr)
         return 2
-    except (KafkaError, InvalidEvent, OSError) as exc:
+    except (KafkaError, InvalidEvent, OSError, StreamFailed, CheckpointError, SinkLogError) as exc:
         print(f"flowcast {args.command}: {exc}", file=sys.stderr)
         return 1
     return 0

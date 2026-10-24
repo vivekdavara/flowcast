@@ -147,3 +147,24 @@ def test_a_closed_pipe_ends_generate_quietly() -> None:
     stderr = process.stderr.read()
     assert process.wait(timeout=60) == 1
     assert stderr == b""  # no traceback, no "Exception ignored ... BrokenPipeError"
+
+
+def test_query_runs_sql_over_the_views_of_a_run(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # Nothing committed yet: the views exist, empty.
+    assert main(["query", "--out", str(tmp_path), "SELECT count(*) AS n FROM minute_aggregates"]) == 0
+    assert capsys.readouterr().out == "n\n0\n"
+
+
+def test_a_bad_query_is_a_failure_not_a_traceback(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["query", "--out", str(tmp_path), "SELECT * FROM no_such_view"]) == 1
+    assert "query failed" in capsys.readouterr().err
+
+
+def test_check_without_a_run_says_so(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["check", "--out", str(tmp_path / "nothing"), "--wait", "0"]) == 1
+    assert "no committed batches" in capsys.readouterr().err
+
+
+def test_stream_needs_a_positive_batch_cap(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["stream", "--max-offsets", "0"]) == 2
+    assert "--max-offsets must be at least 1" in capsys.readouterr().err

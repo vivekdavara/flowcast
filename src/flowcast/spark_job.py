@@ -25,6 +25,7 @@ from pyspark.sql.streaming.query import StreamingQuery
 from pyspark.sql.types import IntegerType, LongType, StringType, StructField, StructType
 
 from flowcast.kafka_io import TOPIC
+from flowcast.layout import Paths
 from flowcast.schema import FIELDS, InvalidEvent, decode
 
 WATERMARK_DELAY = "3 minutes"
@@ -139,28 +140,6 @@ def window_counts(events: DataFrame) -> DataFrame:
 def minute_aggregates(events: DataFrame, delay: str = WATERMARK_DELAY) -> DataFrame:
     """The job's aggregate: `window_counts` of `deduplicated` events."""
     return window_counts(deduplicated(events, delay))
-
-
-@dataclass(frozen=True)
-class Paths:
-    """Where one run of the job writes. Each output has its own checkpoint (one streaming query per output)."""
-
-    root: Path
-
-    @property
-    def dead_letters(self) -> Path:
-        return self.root / "dead_letters"
-
-    @property
-    def raw_events(self) -> Path:
-        return self.root / "raw_events"
-
-    @property
-    def minute_aggregates(self) -> Path:
-        return self.root / "minute_aggregates"
-
-    def checkpoint(self, output: str) -> Path:
-        return self.root / "_checkpoints" / output
 
 
 @dataclass(frozen=True)
