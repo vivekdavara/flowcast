@@ -15,6 +15,7 @@ from confluent_kafka.admin import AdminClient, ConfigResource
 from flowcast.generator import sessions
 from flowcast.kafka_io import (
     KafkaError,
+    ProducerSettings,
     delete_topic,
     ensure_topic,
     produce,
@@ -155,3 +156,13 @@ def test_an_empty_config_means_the_brokers_defaults(topic: str) -> None:
     resource = ConfigResource("topic", topic)
     configs = admin.describe_configs([resource])[resource].result()
     assert configs["retention.bytes"].value == "-1"  # TOPIC_CONFIG would have set 1 GiB
+
+
+def test_the_delivery_accounting_matches_the_topic(topic: str) -> None:
+    assert ensure_topic(BOOTSTRAP, topic, partitions=6)
+    events = [record.event for record in sessions(200)]
+    produced = produce(BOOTSTRAP, topic, events, settings=ProducerSettings(linger_ms=20, compression="lz4"))
+    assert produced.partitions == topic_counts(BOOTSTRAP, topic)
+    read = read_topic(BOOTSTRAP, topic)
+    assert produced.bytes == sum(len(r.key or b"") + len(r.value or b"") for r in read)
+    assert produced.seconds > 0 and produced.records_per_s == produced.records / produced.seconds

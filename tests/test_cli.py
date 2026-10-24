@@ -106,6 +106,12 @@ BOOTSTRAP = os.environ.get("FLOWCAST_TEST_BOOTSTRAP", "")
 
 @pytest.mark.kafka
 @pytest.mark.skipif(not BOOTSTRAP, reason="FLOWCAST_TEST_BOOTSTRAP not set (scripts/kafka.sh start)")
+def acknowledged(line: str) -> dict[int, int]:
+    """The partition counts of produce's "acknowledged by partition: 0: n, 1: m" line."""
+    pairs = (part.split(": ") for part in line.removeprefix("acknowledged by partition: ").split(", "))
+    return {int(p): int(n) for p, n in pairs}
+
+
 def test_topic_produce_and_count(capsys: pytest.CaptureFixture[str]) -> None:
     topic = f"test-{uuid.uuid4()}"
     kafka = ["--bootstrap", BOOTSTRAP, "--topic", topic]
@@ -119,13 +125,22 @@ def test_topic_produce_and_count(capsys: pytest.CaptureFixture[str]) -> None:
 
         assert main(["produce", *kafka, "--sessions", "40", "--seed", "9"]) == 0
         records = sessions(40, Config(seed=9))
-        assert capsys.readouterr().out.startswith(f"produced {len(records)} records to {topic} in ")
+        out = capsys.readouterr().out.splitlines()
+        assert out[0].startswith(f"produced {len(records)} records (")
+        assert sum(acknowledged(out[1]).values()) == len(records)
         assert sorted(r.value for r in read_topic(BOOTSTRAP, topic)) == sorted(encode(r.event) for r in records)
 
         assert main(["count", *kafka]) == 0
         out = capsys.readouterr().out.splitlines()
         assert out[-1] == f"total: {len(records)}"
         assert [line.split(":")[0] for line in out[:-1]] == ["partition 0", "partition 1", "partition 2"]
+
+        # Paced (far faster than real time, so the test is quick), compressed, no linger: the same records again.
+        paced = ["--speed", "100000", "--compression", "zstd", "--linger-ms", "0"]
+        assert main(["produce", *kafka, "--sessions", "40", "--seed", "9", *paced]) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert out[2].startswith("paced at 100000x arrival time; fell behind by at most ")
+        assert sorted(r.value for r in read_topic(BOOTSTRAP, topic)) == sorted(2 * [encode(r.event) for r in records])
     finally:
         delete_topic(BOOTSTRAP, topic)
 
@@ -168,3 +183,12 @@ def test_check_without_a_run_says_so(tmp_path: Path, capsys: pytest.CaptureFixtu
 def test_stream_needs_a_positive_batch_cap(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["stream", "--max-offsets", "0"]) == 2
     assert "--max-offsets must be at least 1" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["--speed", "0"], ["--speed", "nan"], ["--linger-ms", "-1"], ["--batch-bytes", "0"]],
+)
+def test_bad_producer_settings_are_usage_errors(args: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["produce", "--sessions", "1", "--bootstrap", "127.0.0.1:1", "--wait", "0", *args]) == 2
+    assert "flowcast produce:" in capsys.readouterr().err

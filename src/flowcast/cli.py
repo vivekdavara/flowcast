@@ -10,7 +10,7 @@ import csv
 import math
 import os
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from itertools import islice
 from pathlib import Path
@@ -21,16 +21,19 @@ from flowcast import __version__
 from flowcast.check import CheckpointError, check_run
 from flowcast.generator import Config, Emitted, Generator
 from flowcast.kafka_io import (
+    COMPRESSION,
     DEFAULT_BOOTSTRAP,
     MAX_PARTITIONS,
     PARTITIONS,
     TOPIC,
     KafkaError,
+    ProducerSettings,
     ensure_topic,
     produce,
     topic_counts,
     wait_for_broker,
 )
+from flowcast.pacing import Pacer
 from flowcast.schema import Event, InvalidEvent, decode, encode
 from flowcast.truth import duckdb_minute_aggregates, minute_aggregates
 from flowcast.views import SinkLogError, connect
@@ -107,6 +110,12 @@ def build_parser() -> argparse.ArgumentParser:
     send = sub.add_parser("produce", help="send generated events to Kafka, in arrival order")
     _kafka_options(send)
     _stream_options(send)
+    send.add_argument(
+        "--speed", type=float, help="pace by arrival time: 1 is real time, 10 ten times faster (default: no pacing)"
+    )
+    send.add_argument("--linger-ms", type=float, default=ProducerSettings.linger_ms, help="default %(default)s")
+    send.add_argument("--batch-bytes", type=int, default=ProducerSettings.batch_bytes, help="default %(default)s")
+    send.add_argument("--compression", choices=COMPRESSION, default=ProducerSettings.compression)
 
     count = sub.add_parser("count", help="records in each partition of a topic")
     _kafka_options(count)
@@ -191,10 +200,21 @@ def _topic(args: argparse.Namespace) -> None:
 
 
 def _produce(args: argparse.Namespace) -> None:
-    records = _records(args)
+    try:
+        settings = ProducerSettings(args.linger_ms, args.batch_bytes, args.compression)
+        pacer = None if args.speed is None else Pacer(_records(args), args.speed)
+    except ValueError as exc:
+        raise UsageError(str(exc)) from exc
+    events: Iterable[Event] = pacer if pacer is not None else (record.event for record in _records(args))
     wait_for_broker(args.bootstrap, timeout_s=args.wait)
-    produced = produce(args.bootstrap, args.topic, (record.event for record in records))
-    print(f"produced {produced.records} records to {args.topic} in {produced.seconds:.2f} s")
+    produced = produce(args.bootstrap, args.topic, events, settings=settings)
+    print(
+        f"produced {produced.records} records ({produced.bytes:,} bytes) to {args.topic} in {produced.seconds:.2f} s: "
+        f"{produced.records_per_s:,.0f} records/s"
+    )
+    print("acknowledged by partition: " + ", ".join(f"{p}: {n}" for p, n in produced.partitions.items()))
+    if pacer is not None:
+        print(f"paced at {args.speed:g}x arrival time; fell behind by at most {pacer.max_lag_s:.3f} s")
 
 
 def _stream(args: argparse.Namespace) -> None:

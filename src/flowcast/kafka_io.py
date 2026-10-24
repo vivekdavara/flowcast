@@ -10,7 +10,7 @@ import math
 import time
 import uuid
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from confluent_kafka import Consumer, KafkaException, Message, Producer, TopicPartition
 from confluent_kafka import KafkaError as RdKafkaError
@@ -144,15 +144,56 @@ def _served_partitions(admin: AdminClient, name: str, timeout_s: float) -> int |
     return len(topic.partitions)
 
 
+COMPRESSION = ("none", "gzip", "snappy", "lz4", "zstd")
+# librdkafka's limits for linger.ms and batch.size.
+MAX_LINGER_MS = 900_000
+MAX_BATCH_BYTES = 2_147_483_647
+
+
+@dataclass(frozen=True)
+class ProducerSettings:
+    """How the producer batches: wait up to `linger_ms` for a batch to fill, up to `batch_bytes` per partition batch,
+    compressed with `compression`. The defaults are librdkafka's own."""
+
+    linger_ms: float = 5.0
+    batch_bytes: int = 1_000_000
+    compression: str = "none"
+
+    def __post_init__(self) -> None:
+        if not (math.isfinite(self.linger_ms) and 0 <= self.linger_ms <= MAX_LINGER_MS):
+            raise ValueError(f"linger_ms must be between 0 and {MAX_LINGER_MS}")
+        if not 1 <= self.batch_bytes <= MAX_BATCH_BYTES:
+            raise ValueError(f"batch_bytes must be between 1 and {MAX_BATCH_BYTES}")
+        if self.compression not in COMPRESSION:
+            raise ValueError(f"compression must be one of {', '.join(COMPRESSION)}")
+
+    def config(self) -> dict[str, object]:
+        return {"linger.ms": self.linger_ms, "batch.size": self.batch_bytes, "compression.type": self.compression}
+
+
 @dataclass(frozen=True)
 class Produced:
+    """What a produce call sent: every record was acknowledged, or it raised."""
+
     records: int
-    seconds: float
+    seconds: float  # from the first send to the last acknowledgement
+    bytes: int = 0  # keys and values, before compression
+    partitions: dict[int, int] = field(default_factory=dict)  # acknowledged records by partition
+
+    @property
+    def records_per_s(self) -> float:
+        return self.records / self.seconds if self.seconds > 0 else 0.0
 
 
-def produce(bootstrap: str, topic: str, events: Iterable[Event], flush_timeout_s: float = 60.0) -> Produced:
+def produce(
+    bootstrap: str,
+    topic: str,
+    events: Iterable[Event],
+    flush_timeout_s: float = 60.0,
+    settings: ProducerSettings | None = None,
+) -> Produced:
     """Send each event as one record (key user_id, value its wire form), in order, and wait until every one is
-    acknowledged. Raises KafkaError if any record wasn't delivered."""
+    acknowledged. Raises KafkaError if any record wasn't delivered. `events` may pace itself (pacing.Pacer)."""
     _check_timeout(flush_timeout_s)
     producer = Producer(
         {
@@ -160,31 +201,37 @@ def produce(bootstrap: str, topic: str, events: Iterable[Event], flush_timeout_s
             # Idempotence implies acks=all and at most 5 requests in flight per partition, with sequence numbers, so a
             # retried batch can't duplicate or reorder records within a partition.
             "enable.idempotence": True,
-            "linger.ms": 5,
+            **(settings or ProducerSettings()).config(),
         }
     )
     delivered = 0
     failures: list[str] = []
+    partitions: dict[int, int] = {}
 
-    def on_delivery(err: RdKafkaError | None, _msg: Message) -> None:
+    def on_delivery(err: RdKafkaError | None, msg: Message) -> None:
         nonlocal delivered
         if err is not None:
             failures.append(err.str())
         else:
             delivered += 1
+            partition = msg.partition()
+            assert partition is not None
+            partitions[partition] = partitions.get(partition, 0) + 1
 
-    sent = 0
+    sent = sent_bytes = 0
     started = time.perf_counter()
     try:
         for event in events:
             value = encode(event)
+            key = event.user_id.encode()
             while True:
                 try:
-                    producer.produce(topic, value=value, key=event.user_id.encode(), on_delivery=on_delivery)
+                    producer.produce(topic, value=value, key=key, on_delivery=on_delivery)
                     break
                 except BufferError:
                     producer.poll(0.05)  # the local queue is full: serve delivery reports until there is room
             sent += 1
+            sent_bytes += len(value) + len(key)
             producer.poll(0)
     except BaseException as exc:
         # The events failed part way (a bad event, an interrupt): deliver what was already sent before raising, so
@@ -200,7 +247,7 @@ def produce(bootstrap: str, topic: str, events: Iterable[Event], flush_timeout_s
         raise KafkaError(f"{len(failures)} of {sent} records failed; first: {failures[0]}")
     if left or delivered != sent:
         raise KafkaError(f"only {delivered} of {sent} records acknowledged within {flush_timeout_s:g}s")
-    return Produced(sent, seconds)
+    return Produced(sent, seconds, sent_bytes, dict(sorted(partitions.items())))
 
 
 def _flush(producer: Producer, timeout_s: float) -> int:

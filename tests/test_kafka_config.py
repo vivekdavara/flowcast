@@ -7,7 +7,15 @@ import pytest
 
 import flowcast.kafka_io as kafka_io
 from flowcast.generator import sessions
-from flowcast.schema import Event
+from flowcast.schema import Event, encode
+
+
+class FakeMessage:
+    def __init__(self, partition: int) -> None:
+        self._partition = partition
+
+    def partition(self) -> int:
+        return self._partition
 
 
 class FakeProducer:
@@ -24,8 +32,8 @@ class FakeProducer:
         return 0
 
     def flush(self, timeout: float) -> int:
-        for callback in self.callbacks:
-            callback(None, None)
+        for i, callback in enumerate(self.callbacks):
+            callback(None, FakeMessage(i % 2))
         self.callbacks.clear()
         return 0
 
@@ -69,3 +77,31 @@ def test_an_error_part_way_says_when_records_sent_before_it_were_not_delivered()
     with pytest.raises(RuntimeError, match="the source broke") as raised:
         kafka_io.produce("127.0.0.1:1", "t", failing(), flush_timeout_s=0.5)
     assert raised.value.__notes__ == [f"flowcast: of the {len(events)} records sent before this, 0 were acknowledged"]
+
+
+def test_batching_settings_reach_the_producer_and_deliveries_are_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(kafka_io, "Producer", FakeProducer)
+    events = [record.event for record in sessions(3)]
+    settings = kafka_io.ProducerSettings(linger_ms=0, batch_bytes=65_536, compression="zstd")
+    produced = kafka_io.produce("127.0.0.1:1", "t", events, settings=settings)
+    config = FakeProducer.configs[-1]
+    assert (config["linger.ms"], config["batch.size"], config["compression.type"]) == (0, 65_536, "zstd")
+    assert config["enable.idempotence"] is True  # settings can't turn it off
+    assert produced.partitions == {0: (len(events) + 1) // 2, 1: len(events) // 2}
+    assert produced.bytes == sum(len(encode(e)) + len(e.user_id) for e in events)
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"linger_ms": -1}, "linger_ms"),
+        ({"linger_ms": float("nan")}, "linger_ms"),
+        ({"linger_ms": 900_001}, "linger_ms"),
+        ({"batch_bytes": 0}, "batch_bytes"),
+        ({"batch_bytes": 2**31}, "batch_bytes"),
+        ({"compression": "brotli"}, "compression"),
+    ],
+)
+def test_producer_settings_refuse_what_librdkafka_would(changes: dict[str, Any], reason: str) -> None:
+    with pytest.raises(ValueError, match=reason):
+        kafka_io.ProducerSettings(**changes)
