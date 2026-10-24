@@ -37,11 +37,22 @@ jobs:
       FLOWCAST_TEST_BOOTSTRAP: localhost:9192
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-java@v5
+        # Spark 4 runs on Java 17 or 21; the laptop uses 21.
+        with:
+          distribution: temurin
+          java-version: "21"
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: pyproject.toml
+      - name: Cache Spark's Kafka source jars
+        # spark.jars.packages fetches them from Maven Central into ~/.ivy2.5.2 on first use; the key is the PySpark pin.
+        uses: actions/cache@v6
+        with:
+          path: ~/.ivy2.5.2
+          key: ivy-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
       - name: Install
         run: pip install -e '.[dev]'
       - name: Lint
