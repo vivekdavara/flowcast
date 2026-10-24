@@ -223,6 +223,8 @@ def _stream(args: argparse.Namespace) -> None:
     wait_for_broker(args.bootstrap, timeout_s=args.wait)
     topic_counts(args.bootstrap, args.topic)  # the topic must exist: the job doesn't create it
     # Imported here: starting Spark takes seconds and needs Java, which no other command does.
+    from pyspark.errors import StreamingQueryException
+
     from flowcast.layout import Paths
     from flowcast.spark_job import kafka_records, session, start
 
@@ -239,11 +241,15 @@ def _stream(args: argparse.Namespace) -> None:
                 spark.streams.awaitAnyTermination()  # returns or raises only if a query ends by itself (a failure)
         except KeyboardInterrupt:
             pass
+        except StreamingQueryException:
+            pass  # reported below, with every query that failed, once the others are stopped
         finally:
             queries.stop()
-        failed = [q.name for q in queries.all() if q.exception() is not None]
-        if failed:
-            raise StreamFailed(f"queries failed: {', '.join(failed)} (see the log above)")
+        failures = [(q.name, q.exception()) for q in queries.all() if q.exception() is not None]
+        if failures:
+            first = str(failures[0][1]).strip().splitlines()[0][:300]
+            names = ", ".join(name for name, _ in failures)
+            raise StreamFailed(f"queries failed: {names}; the first: {first} (Spark's log above has the rest)")
     finally:
         spark.stop()
 
@@ -256,16 +262,19 @@ def _check(args: argparse.Namespace) -> None:
 
 
 def _query(args: argparse.Namespace) -> None:
-    con = connect(args.out)
     try:
-        result = con.execute(args.sql)
-        writer = csv.writer(sys.stdout, lineterminator="\n")
-        writer.writerow([column[0] for column in result.description or []])
-        writer.writerows(result.fetchall())
+        con = connect(args.out)
+        try:
+            result = con.execute(args.sql)
+            columns = [column[0] for column in result.description or []]
+            rows = result.fetchall()
+        finally:
+            con.close()
     except duckdb.Error as exc:
         raise StreamFailed(f"query failed: {exc}") from exc
-    finally:
-        con.close()
+    writer = csv.writer(sys.stdout, lineterminator="\n")
+    writer.writerow(columns)
+    writer.writerows(rows)
 
 
 def _count(args: argparse.Namespace) -> None:
@@ -301,7 +310,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except UsageError as exc:
         print(f"flowcast {args.command}: {exc}", file=sys.stderr)
         return 2
-    except (KafkaError, InvalidEvent, OSError, StreamFailed, CheckpointError, SinkLogError) as exc:
+    except (KafkaError, InvalidEvent, OSError, StreamFailed, CheckpointError, SinkLogError, duckdb.Error) as exc:
         print(f"flowcast {args.command}: {exc}", file=sys.stderr)
         return 1
     return 0
