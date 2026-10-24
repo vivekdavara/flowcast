@@ -13,7 +13,8 @@ from confluent_kafka import Producer
 from flowcast.check import committed_batches, expected_rows, replay
 from flowcast.generator import Config, sessions
 from flowcast.kafka_io import delete_topic, ensure_topic, produce, read_topic, wait_for_broker
-from flowcast.truth import Row, minute_aggregates
+from flowcast.truth import Row, minute_aggregates, minute_aggregates_sql
+from flowcast.views import connect
 from tests.test_schema import make, raw
 
 BOOTSTRAP = os.environ.get("FLOWCAST_TEST_BOOTSTRAP", "")
@@ -89,3 +90,25 @@ def test_the_job_writes_exactly_what_the_replay_of_its_batches_says(spark: Any, 
     assert raw_events.select("partition", "offset").distinct().count() == len(events)
     letters = spark.read.parquet(str(paths.dead_letters)).collect()
     assert sorted(bytes(r.value) for r in letters) == sorted(BAD)
+
+    # DuckDB's views (built from the sinks' logs) see the same rows; and the truth's SQL over the raw events gives the
+    # truth of every event, very late ones included: the raw output lost nothing.
+    con = connect(tmp_path)
+    try:
+        aggregates = con.execute("SELECT window_start, event_type, events, revenue_cents FROM minute_aggregates")
+        assert sorted(Row(*r) for r in aggregates.fetchall()) == written
+        counts = con.execute('SELECT count(*), count(DISTINCT (partition, "offset")) FROM raw_events').fetchone()
+        assert counts == (len(events), len(events))
+        mismatched = (
+            "SELECT count(*) FROM raw_events WHERE event_date <> CAST(make_timestamp(event_time * 1000) AS DATE)"
+        )
+        assert con.execute(mismatched).fetchone() == (0,)
+        assert sorted(bytes(v) for (v,) in con.execute("SELECT value FROM dead_letters").fetchall()) == sorted(BAD)
+        input_order = 'row_number() OVER (ORDER BY partition, "offset") AS input_order'
+        con.execute(f"CREATE VIEW events AS SELECT {input_order}, * FROM raw_events")
+        truth_sql = [
+            Row(int(a), str(b), int(c), int(d)) for a, b, c, d in con.execute(minute_aggregates_sql()).fetchall()
+        ]
+        assert truth_sql == minute_aggregates(events)
+    finally:
+        con.close()

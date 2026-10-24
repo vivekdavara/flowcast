@@ -61,6 +61,8 @@ def session(app: str = "flowcast", master: str = "local[*]", *, kafka: bool = Tr
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.shuffle.partitions", str(STATE_PARTITIONS))
         .config("spark.sql.streaming.minBatchesToRetain", str(BATCHES_TO_RETAIN))
+        # Parquet's standard timestamp (UTC microseconds) rather than Spark's legacy INT96 default.
+        .config("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS")
         .config("spark.ui.enabled", "false")
     )
     if kafka:

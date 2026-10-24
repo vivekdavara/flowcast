@@ -1,0 +1,109 @@
+import json
+from pathlib import Path
+
+import duckdb
+import pytest
+
+from flowcast.views import COLUMNS, SinkLogError, committed_files, connect
+
+
+def log_file(sink: Path, name: str, entries: list[tuple[Path | str, str]], version: str = "v1") -> None:
+    log = sink / "_spark_metadata"
+    log.mkdir(parents=True, exist_ok=True)
+    lines = [version]
+    for path, action in entries:
+        uri = path if isinstance(path, str) else path.as_uri()
+        lines.append(json.dumps({"path": uri, "size": 1, "isDir": False, "action": action}))
+    (log / name).write_text("\n".join(lines))
+
+
+def test_no_log_is_no_files(tmp_path: Path) -> None:
+    assert committed_files(tmp_path / "missing") == []
+    assert committed_files(tmp_path) == []
+
+
+def test_the_batch_files_list_the_committed_files(tmp_path: Path) -> None:
+    a, b, c = (tmp_path / f"part-{n}.parquet" for n in "abc")
+    log_file(tmp_path, "0", [(a, "add"), (b, "add")])
+    log_file(tmp_path, "1", [(c, "add")])
+    (tmp_path / "_spark_metadata" / ".1.crc").write_text("")
+    (tmp_path / "_spark_metadata" / ".2.6f1e.tmp").write_text("v1\n")  # a batch still being logged
+    assert committed_files(tmp_path) == [a, b, c]
+
+
+def test_the_latest_compact_file_replaces_the_files_before_it(tmp_path: Path) -> None:
+    files = [tmp_path / f"part-{n}.parquet" for n in range(4)]
+    log_file(tmp_path, "8", [(tmp_path / "gone.parquet", "add")])  # older than the compact file: not read
+    log_file(tmp_path, "9.compact", [(files[0], "add"), (files[1], "add")])
+    log_file(tmp_path, "10", [(files[2], "add"), (files[0], "delete")])
+    log_file(tmp_path, "11", [(files[3], "add")])
+    assert committed_files(tmp_path) == [files[1], files[2], files[3]]
+
+
+def test_a_percent_encoded_uri_is_decoded(tmp_path: Path) -> None:
+    path = tmp_path / "event_date=2026-01-01" / "part 0.parquet"
+    log_file(tmp_path, "0", [(path, "add")])
+    assert committed_files(tmp_path) == [path]
+
+
+@pytest.mark.parametrize(
+    ("names", "reason"),
+    [
+        (["0", "2"], "consecutive"),
+        (["1"], "consecutive"),
+        (["9.compact", "11"], "consecutive"),
+        (["0", "notes.txt"], "not a sink log file"),
+    ],
+)
+def test_a_log_with_a_gap_or_a_stranger_is_refused(tmp_path: Path, names: list[str], reason: str) -> None:
+    for name in names:
+        log_file(tmp_path, name, [])
+    with pytest.raises(SinkLogError, match=reason):
+        committed_files(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("entries", "version", "reason"),
+    [
+        ([], "v2", "version-1"),
+        ([("hdfs://namenode/part-0.parquet", "add")], "v1", "isn't a local file"),
+        ([("file:///part-0.parquet", "rename")], "v1", "unknown action"),
+    ],
+)
+def test_an_entry_it_cant_read_is_refused(
+    tmp_path: Path, entries: list[tuple[str, str]], version: str, reason: str
+) -> None:
+    log_file(tmp_path, "0", entries, version)  # type: ignore[arg-type]
+    with pytest.raises(SinkLogError, match=reason):
+        committed_files(tmp_path)
+
+
+def test_a_sink_with_nothing_committed_is_an_empty_view_with_the_right_columns(tmp_path: Path) -> None:
+    con = connect(tmp_path)
+    try:
+        for name, columns in COLUMNS.items():
+            assert con.execute(f"SELECT count(*) FROM {name}").fetchone() == (0,)
+            described = con.execute(f"DESCRIBE {name}").fetchall()
+            assert [(row[0], row[1]) for row in described] == [
+                (column, kind.replace("TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE")) for column, kind in columns.items()
+            ]
+    finally:
+        con.close()
+
+
+def test_a_view_reads_the_logged_files_and_not_a_stray_one(tmp_path: Path) -> None:
+    sink = tmp_path / "minute_aggregates"
+    sink.mkdir()
+    logged, stray = sink / "part-0.parquet", sink / "part-1.parquet"
+    row = (
+        "SELECT {}::BIGINT AS window_start, 'page_view' AS event_type, {}::BIGINT AS events, 0::BIGINT AS revenue_cents"
+    )
+    with duckdb.connect() as con:
+        con.execute(f"COPY ({row.format(0, 3)}) TO '{logged}'")
+        con.execute(f"COPY ({row.format(60_000, 99)}) TO '{stray}'")  # left by a batch that failed
+    log_file(sink, "0", [(logged, "add")])
+    con = connect(tmp_path)
+    try:
+        assert con.execute("SELECT * FROM minute_aggregates").fetchall() == [(0, "page_view", 3, 0)]
+    finally:
+        con.close()
