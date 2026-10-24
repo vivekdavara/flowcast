@@ -12,9 +12,14 @@ window the job has written: those whose end is at or before the last batch's wat
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from flowcast.kafka_io import Record
+from flowcast.schema import Event, InvalidEvent, decode
+from flowcast.truth import WINDOW_MS, Row, minute_aggregates
 
 
 @dataclass(frozen=True)
@@ -56,3 +61,46 @@ def kafka_end_offsets(batch: Batch, topic: str) -> dict[int, int]:
     if len(batch.sources) != 1 or not isinstance(batch.sources[0], dict) or topic not in batch.sources[0]:
         raise CheckpointError(f"batch {batch.batch_id} doesn't read the Kafka topic {topic}")
     return {int(p): int(o) for p, o in batch.sources[0][topic].items()}
+
+
+@dataclass(frozen=True)
+class Replay:
+    kept: list[Event]  # valid records the stream had to keep, in batch order then partition and offset
+    dropped: list[Event]  # valid records at or before their batch's late-events watermark
+    invalid: int  # records `decode` refuses (the job's dead letters)
+    unread: int  # records past the last committed batch's end offsets
+    watermark_ms: int  # the last committed batch's watermark: windows ending at or before it are written
+
+
+def replay(records: Iterable[Record], batches: Sequence[Batch], topic: str) -> Replay:
+    """Assign each record to the batch that read it, and keep it or drop it as the stream did."""
+    by_partition: dict[int, list[Record]] = {}
+    for record in sorted(records, key=lambda r: (r.partition, r.offset)):
+        by_partition.setdefault(record.partition, []).append(record)
+    position = {p: 0 for p in by_partition}  # index of the next unassigned record in each partition
+    kept: list[Event] = []
+    dropped: list[Event] = []
+    invalid = 0
+    late_watermark = 0  # batch 0 runs with no earlier watermark
+    for batch in batches:
+        ends = kafka_end_offsets(batch, topic)
+        for partition, partition_records in sorted(by_partition.items()):
+            end = ends.get(partition, 0)
+            i = position[partition]
+            while i < len(partition_records) and partition_records[i].offset < end:
+                try:
+                    event = decode(partition_records[i].value)
+                except InvalidEvent:
+                    invalid += 1
+                else:
+                    (dropped if event.event_time <= late_watermark else kept).append(event)
+                i += 1
+            position[partition] = i
+        late_watermark = batch.watermark_ms
+    unread = sum(len(rs) - position[p] for p, rs in by_partition.items())
+    return Replay(kept, dropped, invalid, unread, batches[-1].watermark_ms if batches else 0)
+
+
+def expected_rows(result: Replay) -> list[Row]:
+    """The rows the stream must have written: the truth of the kept records, in windows the watermark has passed."""
+    return [row for row in minute_aggregates(result.kept) if row.window_start + WINDOW_MS <= result.watermark_ms]
