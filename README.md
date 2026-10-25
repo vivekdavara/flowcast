@@ -14,7 +14,7 @@ result can be checked against it.
 |---|---|---|
 | 1 | Design, event schema, generator, ground truth, local Kafka, round trip, CI | done |
 | 2 | Producer at volume; the Spark job (validate, dead letters, raw events, windowed aggregates); DuckDB views; the exact check | done |
-| 3 | Exactly-once across restarts; late data; schema version 2; batch backfill | |
+| 3 | Exactly-once across killed and restarted jobs (file sinks, an idempotent DuckDB sink, SIGKILL tests); late-data accounting against Spark's metrics; schema version 2; batch backfill | done |
 | 4 | Benchmarks (throughput, end-to-end latency, trigger intervals); data-quality checks | |
 | 5 | Static HTML report, results, walkthrough, v1.0.0 | |
 
@@ -30,31 +30,42 @@ flowchart LR
   P --> K[("Kafka: clickstream<br/>6 partitions, KRaft")]
   K --> S["Spark Structured Streaming<br/>3 queries, one checkpoint each"]
   S --> PQ["Parquet<br/>raw, aggregates, dead letters"]
+  S -->|"--duckdb: foreachBatch"| DS[("DuckDB sink<br/>rows + batch id per transaction")]
+  PQ -->|"raw events"| B["batch backfill<br/>the stream's transformations"]
   PQ --> D["DuckDB views<br/>(from the sinks' logs)"]
-  S -.->|"checkpoints: offsets + watermark per batch"| C["flowcast check<br/>replay vs truth"]
+  B --> D
+  S -.->|"checkpoints, restarts,<br/>progress reports"| C["flowcast check<br/>replay vs truth"]
+  DS -.-> C
   T -.-> C
   D -.-> C
 ```
 
-Built so far (days 1 and 2): the whole pipeline, and an exact check of its output. Day 3 adds exactly-once across a
-killed job, schema version 2 and the batch backfill.
+Built so far (days 1 to 3): the whole pipeline; an exact check of its output; exactly-once across a job killed with
+SIGKILL mid-batch and restarted (and what the kills taught about Spark's watermark); Spark's own late-row metrics
+checked against the replay batch by batch; schema version 2 with readers of both; and a batch backfill that reuses the
+stream's transformations and must equal the truth of every event.
 
 ## Layout
 
 ```
 src/flowcast/
-  schema.py               the event (version 1): fields, strict decoder, byte-stable encoder
+  schema.py               the event (versions 1 and 2): fields, strict decoder, byte-stable encoder
   generator.py            sessions, arrival order, late records, duplicates, determinism
   truth.py                exact minute aggregates in Python and DuckDB
   sql/minute_aggregates.sql
   kafka_io.py             topic creation, idempotent producer (settings, accounting), snapshot reader, counts
   pacing.py               replays arrival times against the wall clock
   spark_job.py            the job: parse (decode in a UDF), dead letters, raw events, dedupe, windows, start
-  layout.py               where a run writes (an output and a checkpoint per query)
-  check.py                the replay of a run's batches over Kafka, and the report
-  views.py                DuckDB views from the file sinks' logs
-  cli.py                  flowcast generate | truth | topic | produce | count | stream | check | query | version
+  duckdb_sink.py          the idempotent DuckDB sink (rows + batch id in one transaction, bound to the query id)
+  backfill.py             the batch backfill over the raw events, published by an atomic pointer
+  restarts.py             each query's state at every start (which re-run batches the file sink skipped)
+  recovery.py             kill the running job with SIGKILL at random moments, restart it
+  layout.py               where a run writes (an output and a checkpoint per query, progress, backfill)
+  check.py                the replay of a run's batches over Kafka, late-data accounting, and the report
+  views.py                DuckDB views from the file sinks' logs; orphan files
+  cli.py                  flowcast generate | truth | topic | produce | count | stream | check | backfill | query
 scripts/kafka.sh          local single-node Kafka (start/stop/status/bootstrap/logs/reset)
+scripts/kill_restart.py   the kill-and-restart run at size
 scripts/measure_generator.py, scripts/measure_encode.py
 tests/                    unit, property, differential, Kafka and Spark tests
 ```
@@ -94,13 +105,27 @@ Run the job and check it:
 .venv/bin/flowcast query --out data/demo "SELECT * FROM minute_aggregates ORDER BY window_start LIMIT 10"
 ```
 
+Exactly once, the backfill and schema version 2:
+
+```bash
+.venv/bin/flowcast stream --topic demo --out data/demo --available-now --max-offsets 2000 --duckdb
+.venv/bin/flowcast backfill --out data/demo
+.venv/bin/flowcast check --topic demo --out data/demo
+.venv/bin/python scripts/kill_restart.py --topic kill-demo --out data/kill-demo --sessions 3000 --kills 10
+.venv/bin/flowcast produce --topic demo --sessions 1000 --schema-version 2
+```
+
+`--duckdb` adds the DuckDB sink (`<out>/aggregates.duckdb`); `check` then holds it to its own query's replay, and it
+holds a published backfill to the truth of every raw record. `kill_restart.py` produces to a new topic, kills the job
+with SIGKILL at random moments, restarts it each time, and checks the result.
+
 `stream` without `--available-now` runs until Ctrl-C, a batch every `--trigger` seconds (5); `produce --speed 1`
 paces records by their arrival times (real time; 10 is ten times faster), and `--linger-ms`, `--batch-bytes` and
 `--compression` set the producer's batching.
 
 `generate --sessions N` writes every record of N whole sessions (very late ones included); `--records N` is the first
-N records of the endless stream, which is what a collector would have received by then. Both take `--seed` and the
-disorder settings (`--late-fraction`, `--very-late-fraction`, `--duplicate-fraction`).
+N records of the endless stream, which is what a collector would have received by then. Both take `--seed`, the
+disorder settings (`--late-fraction`, `--very-late-fraction`, `--duplicate-fraction`) and `--schema-version`.
 
 ## Results (day 1)
 
@@ -139,6 +164,24 @@ battery at 22-42%, charging), with Vivek's own apps open (load average 8 to 17 d
 What these aren't: day 4's benchmarks. The job's throughput, the cost of the parse UDF and end-to-end latency are
 measured there, on an idle machine.
 
+## Results (day 3)
+
+Synthetic data. Apple M3, macOS 26.6.2, Python 3.11.12, PySpark 4.2.0 on Java 21.0.12. The kill run ran on AC (the
+battery charging from 40%) while another Claude Code session (the other portfolio track) ran its own work: load average
+54.8 at the start, so its times are a busy laptop's, not benchmarks.
+
+| What | Result | Command |
+|---|---|---|
+| Kill and restart at size | 3,000 sessions (11,966 events at 0.5 sessions a second of event time, plus 3 invalid records), 300 records a batch, **10 SIGKILLs** of the running job (driver, JVM and Python workers), 11 starts: every output exact. 494 aggregate rows written, 494 expected; **the DuckDB sink 494 of 494**; 11,966 raw events, each Kafka record once; 3 dead letters; 0 watermark differences | `.venv/bin/python scripts/kill_restart.py --topic kill-d3 --out data/kill-d3 --sessions 3000 --kills 10` at `c576dc4` (the script's DuckDB change uncommitted then, committed with this table) |
+| Where the kills landed | across the 4 queries at the 10 kills: **30 planned but not logged, 6 logged but not committed**, 4 between batches; 15 raw-event and 2 dead-letter files left as orphans, never read | same |
+| A skipped re-run in that run | batch 6 of `minute_aggregates` was logged but not committed at kill 6, so the next start re-ran it and the file sink skipped it; the start log named it, and every watermark matched the records once its records were left out | same |
+| Late-data accounting | over the 33 of 42 batches with Spark's progress saved (killed runs save none; the skipped re-run is left out): **Spark's dedupe dropped 1,267 rows as late, the replay 1,267; duplicates 71 and 71**; the window aggregation dropped 0 | same |
+| Rows dropped as late | 1,280 of 11,966 valid records in that run, against 55 of 39,346 in day 2's run at 2,000 records a batch; the replay agrees exactly either way. Why small batches over a backlog drop so many more is for day 4's batch-size comparison | same; day 2's demo |
+| Its length | 266 s for all 11 rounds (each restart starts a JVM and Spark); 82 s for the last, uninterrupted one | same |
+
+The tests' runs (`test_recovery.py`, `test_kill.py`, `test_backfill.py`, `test_spark_stream.py`) check the same things on
+smaller streams on every `make check` and in CI; the backfill there equals the truth of every event exactly.
+
 ## Tests
 
 - `tests/test_schema.py`: every rule of the field table refuses a bad value with its reason; JSON edge cases
@@ -174,6 +217,25 @@ measured there, on an idle machine.
 - `tests/test_views.py`: reading the sink log (compaction, deletes, gaps, strangers, URIs) and the views.
 - `tests/test_pacing.py`: the pacer on a fake clock.
 - `tests/review_d2/`: the day-2 review's findings, each failing at `0eb546a`.
+
+Day 3:
+
+- `tests/test_recovery.py` (Kafka and Spark): a finished run put back into each state a crash leaves its last batch in
+  (logged by the sink but not committed; or not logged, its files left as orphans), for all four queries, the DuckDB
+  sink's included; restarted with new records; every output must reconcile exactly, the re-run batch must keep the
+  offsets it planned, nothing may be counted twice (a glob of the directory would), and Spark's late and duplicate
+  counts must equal the replay's.
+- `tests/test_kill.py` (Kafka and Spark): three SIGKILLs of the running job at random moments, restarts, the check
+  exact; the query states it records.
+- `tests/test_restarts.py`: the restart log (a torn line from a killed start skipped), and which re-runs the file sink
+  skipped.
+- `tests/test_duckdb_sink.py`: a replayed batch is skipped, an empty batch counts, a gap or another query's batch is
+  refused, and a window written twice rolls the whole batch back (no Spark).
+- `tests/test_backfill.py` (Spark; one with Kafka): a streamed run's backfill equals the truth exactly and is never
+  below the stream; raw files from before and after schema version 2 backfill to the truth; the pointer is validated.
+- `tests/test_check.py` grew: orphans reported, a backfill held to the truth, a skipped re-run's records left out of the
+  watermark (and only that batch's), the late-data accounting (per-batch counts, partial coverage, each difference
+  failing). `tests/test_schema.py`, `test_generator.py`, `test_spark_parse.py` and `test_views.py` cover version 2.
 
 CI (`.github/workflows/ci.yml`): lint, types and every test (Spark on Temurin 21, its jars cached) against an
 `apache/kafka:4.3.1` service container; and
@@ -239,6 +301,15 @@ with 2- and 4-minute checkpoints and required by the end-to-end test; the job mu
 (outside the spec) could make `check` report a correct job as wrong; `check` on a running job can race a commit.
 It also said that its `pkill -f` had killed a process of my test run (see `b5b6b09` and `29332c3`'s messages).
 
+## Review of day 3
+
+No review agent today: the other portfolio track's session was running on the same machine for the whole window, and
+two sessions plus an agent hit the account's usage limit once before (October 14). The day's own kill test did a
+reviewer's job: it found the skipped re-run's watermark (above), which the hand-made crash states in `test_recovery.py`
+hadn't shown (I didn't establish why; their cut-off batch is the last of an available-now run). The first run of the DuckDB sink's tests found that DuckDB's
+`executemany` refuses an empty list, which most batches of a stream are; mutating the views' `union_by_name` away
+fails the schema test.
+
 ## Design decisions
 
 - **Integer cents and integer milliseconds**, so Python, DuckDB and Spark compute identical answers, compared with `==`.
@@ -259,15 +330,33 @@ It also said that its `pkill -f` had killed a process of my test run (see `b5b6b
 - **Spark on loopback**, UTC, 6 state partitions, standard Parquet timestamps.
 - **`kafka.sh` stops only its own pid** (`kafka-server-stop` would signal every broker on the machine), binds to
   loopback, and deletes only a directory it made.
+- **Exactly once is each sink's job, and the replay is the proof**: the file sink skips a batch already in its log,
+  the DuckDB sink skips a batch id already in its table (in the same transaction as the rows), and after any crash
+  `check` must still find every output equal to the replay of its own query's batches.
+- **The DuckDB sink is bound to its query's id**: batch ids restart at 0 with a new checkpoint, and a sink keyed by
+  batch id alone would silently skip the new query's first batches as already written.
+- **Record what the checkpoint can't say**: a file-sink batch re-run after a crash is skipped without being executed,
+  so its records never move the watermark. Nothing in the checkpoint shows it; the job's start log does.
+- **The backfill is the stream's own code**, published by renaming a pointer file, so a reader never sees half of it.
+- **Readers before writers**: the decoder reads both versions; a producer upgraded first would send its records to
+  dead letters, visibly, not to wrong answers.
 
-## Limitations (day 2)
+## Limitations (day 3)
 
-- Three queries each read Kafka and run the parse UDF: three times the reading and parsing of one query with a shared
-  source (day 4 measures the cost; `foreachBatch` into three sinks would trade it for doing exactly-once by hand).
-- Exactly-once across a killed job isn't tested yet (day 3), and `flowcast check` must run on a stopped job: on a live
-  one a batch can commit between its reads. It compares raw events and dead letters by count, not record by record.
+- Three queries (four with `--duckdb`) each read Kafka and run the parse UDF: that many times the reading and parsing
+  of one query with a shared source (day 4 measures the cost).
+- `flowcast check` must run on a stopped job: on a live one a batch can commit between its reads. It compares raw
+  events and dead letters by count, not record by record.
 - The check assumes copies of an event_id are identical, as the generator makes them; copies that differ (outside the
-  spec, though `decode` accepts them) could make it report a correct job as wrong.
+  spec, though `decode` accepts them) could make it report a correct job as wrong, and the backfill's `dropDuplicates`
+  keeps an arbitrary copy.
+- The late-data accounting covers only batches whose progress reports were saved: a run saves them when it ends, so a
+  killed run's are lost (the check says how many batches it compared). A `StreamingQueryListener` would write them as
+  they happen, but delivers them asynchronously, so the last ones can miss a run that stops.
+- Explaining watermarks after a restart needs the start log: a run directory written without it (older code) can show
+  watermark differences after a crash that the check can't attribute.
+- The DuckDB sink has one writer, and DuckDB locks the file while a batch is written: a reader can open it only between
+  batches. Orphan files and old backfill directories are reported or kept, never deleted.
 - Event-time skew between devices isn't modelled: each event's time is its true time, and lateness is all in transit.
 - One broker, replication factor 1, Spark in local mode: a laptop pipeline, not a fault-tolerant cluster.
 - `read_topic` gives up on any consumer error rather than retrying transient ones, and can't finish a compacted or

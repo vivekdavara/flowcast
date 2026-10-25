@@ -2,9 +2,10 @@
 
     .venv/bin/python scripts/kill_restart.py --topic kill-demo --sessions 3000 --kills 10 --out data/kill-demo
 
-Produces the sessions to a new topic, runs `flowcast stream --available-now` in rounds that each end in a SIGKILL of
-the whole process group (flowcast.recovery), lets a last round finish, and runs `check_run`: every output must
-reconcile exactly with the replay of its own query's batches, with no record counted twice. Prints where each
+Produces the sessions to a new topic, runs `flowcast stream --available-now --duckdb` in rounds that each end in a
+SIGKILL of the whole process group (flowcast.recovery), lets a last round finish, and runs `check_run`: every output,
+the DuckDB sink's included, must reconcile exactly with the replay of its own query's batches, with no record counted
+twice. Prints where each
 query's last batch was when each kill landed. Needs a broker (`make kafka-start`).
 """
 
@@ -78,6 +79,7 @@ def main() -> int:
         rng=random.Random(args.seed),
         max_wait_s=args.max_wait,
         log=args.out / "stream.log",
+        duckdb=True,
     )
     for kill in outcome.kills:
         where = "; ".join(
@@ -88,7 +90,7 @@ def main() -> int:
     phases = outcome.phases()
     print(
         f"{len(outcome.kills)} kills ({outcome.finished_early} rounds finished before their kill), "
-        f"{len(QUERIES)} queries each: " + ", ".join(f"{n} {phase}" for phase, n in sorted(phases.items()))
+        f"{len(QUERIES) + 1} queries each: " + ", ".join(f"{n} {phase}" for phase, n in sorted(phases.items()))
     )
     print(f"last round {outcome.final_seconds:.1f} s; all rounds {time.monotonic() - started:.1f} s")
 
