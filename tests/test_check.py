@@ -12,6 +12,8 @@ from flowcast.check import (
     committed_batches,
     expected_rows,
     kafka_end_offsets,
+    late_accounting,
+    read_progress,
     replay,
 )
 from flowcast.kafka_io import Record
@@ -340,3 +342,71 @@ def test_a_skipped_reruns_records_dont_move_the_recomputed_watermark() -> None:
     assert replay(records, batches, TOPIC, unobserved={1}).watermark_errors == []
     # Only that batch: told the wrong one, the recomputation still finds the difference.
     assert replay(records, batches, TOPIC, unobserved={0}).watermark_errors != []
+
+
+def progress(batch_id: int, late: int, duplicates: int, aggregate_late: int = 0) -> dict[str, object]:
+    """A progress report as Spark writes it, cut down to what the accounting reads."""
+    return {
+        "batchId": batch_id,
+        "stateOperators": [
+            {"operatorName": "stateStoreSave", "numRowsDroppedByWatermark": aggregate_late},
+            {
+                "operatorName": "dedupeWithinWatermark",
+                "numRowsDroppedByWatermark": late,
+                "customMetrics": {"numDroppedDuplicateRows": duplicates},
+            },
+        ],
+    }
+
+
+ACCOUNTED = [
+    rec(0, 0, ev(1, T0)),
+    rec(0, 1, ev(1, T0)),  # a copy in the same batch: a duplicate
+    rec(0, 2, ev(2, T0 - 200_000)),  # batch 1, at or before batch 0's watermark... which is 0: kept
+    rec(0, 3, ev(1, T0)),  # batch 2: a copy of a kept id, after the watermark moved: still in state, a duplicate
+    rec(0, 4, ev(3, T0 - 200_000)),  # batch 2: before batch 1's watermark (T0 - 180 s): late
+    rec(0, 5, ev(3, T0 - 200_000)),  # its copy: late too, counted again
+]
+ACCOUNTED_BATCHES = [batch(0, 0, p0=2), batch(1, T0 - 180_000, p0=3), batch(2, T0 - 180_000, p0=6)]
+
+
+def test_the_replay_counts_each_batchs_late_rows_and_duplicates() -> None:
+    result = replay(ACCOUNTED, ACCOUNTED_BATCHES, TOPIC)
+    assert result.per_batch == {0: (0, 1), 1: (0, 0), 2: (2, 1)}
+
+
+def test_late_accounting_compares_sparks_counts_with_the_replays(tmp_path: Path) -> None:
+    result = replay(ACCOUNTED, ACCOUNTED_BATCHES, TOPIC)
+    path = tmp_path / "progress.jsonl"
+    reports = [progress(0, 0, 1), progress(1, 0, 0), progress(2, 0, 0), progress(2, 2, 1)]  # batch 2 re-ran
+    path.write_text("".join(json.dumps(r) + "\n" for r in reports))
+    read = read_progress(path)
+    assert read[2] == reports[-1]  # the last report of a batch wins
+    accounting = late_accounting(read, result, ACCOUNTED_BATCHES)
+    assert (accounting.batches, accounting.late, accounting.duplicates) == (3, (2, 2), (2, 2)) and accounting.ok
+    assert "dropped as late 2 (Spark) vs 2 (replay), duplicates 2 vs 2" in accounting.line()
+
+    # Batches with no report (a killed run's) and skipped re-runs are left out, not counted as zero.
+    partial = late_accounting({2: reports[-1]}, result, ACCOUNTED_BATCHES)
+    assert (partial.batches, partial.late, partial.duplicates) == (1, (2, 2), (1, 1)) and partial.ok
+    assert late_accounting(read, result, ACCOUNTED_BATCHES, skipped={2}).late == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "reports",
+    [
+        {0: progress(0, 0, 1), 2: progress(2, 1, 1)},  # Spark dropped fewer rows than the replay says
+        {0: progress(0, 0, 0), 2: progress(2, 2, 1)},  # a duplicate Spark didn't drop
+        {0: progress(0, 0, 1), 2: progress(2, 2, 1, aggregate_late=1)},  # the window aggregation dropped a row
+    ],
+)
+def test_late_accounting_fails_on_any_difference(reports: dict[int, dict[str, object]]) -> None:
+    accounting = late_accounting(reports, replay(ACCOUNTED, ACCOUNTED_BATCHES, TOPIC), ACCOUNTED_BATCHES)
+    assert not accounting.ok and accounting.line().endswith("DIFFERENT")
+
+
+def test_a_report_without_the_dedupe_operator_is_refused() -> None:
+    report = progress(0, 0, 0)
+    report["stateOperators"] = report["stateOperators"][:1]  # type: ignore[index]
+    with pytest.raises(CheckpointError, match="expected one dedupeWithinWatermark operator, found 0"):
+        late_accounting({0: report}, replay(ACCOUNTED, ACCOUNTED_BATCHES, TOPIC), ACCOUNTED_BATCHES)

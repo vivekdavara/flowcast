@@ -105,6 +105,10 @@ def test_a_batch_cut_off_before_its_commit_runs_again_exactly_once(
     report = check_run(BOOTSTRAP, topic, tmp_path)
     assert report.ok, "\n".join(report.lines())
     assert report.replay.unread == 0 and report.replay.invalid == len(BAD)
+    # Spark's own counts agree with the replay's in every batch it reported (a skipped re-run's report counts nothing).
+    assert report.late is not None and report.late.ok, report.late
+    assert report.late.late[0] > 0 and report.late.duplicates[0] > 0
+    assert report.late.batches == report.late.committed - len(report.skipped_reruns)
     # The second start recorded where each query stood; a batch the file sink had logged was skipped on its re-run.
     assert report.restarts == 2
     assert report.skipped_reruns == ([cut["minute_aggregates"][0]] if logged else [])

@@ -265,6 +265,7 @@ def _stream(args: argparse.Namespace) -> None:
             pass  # reported below, with every query that failed, once the others are stopped
         finally:
             queries.stop()
+            queries.save_progress(Paths(args.out))
         failures = [(q.name, q.exception()) for q in queries.all() if q.exception() is not None]
         if failures:
             first = str(failures[0][1]).strip().splitlines()[0][:300]

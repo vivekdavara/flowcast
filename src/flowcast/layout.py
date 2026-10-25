@@ -37,6 +37,10 @@ class Paths:
         """The idempotent DuckDB sink's database (written only when the job runs with it)."""
         return self.root / "aggregates.duckdb"
 
+    def progress(self, output: str) -> Path:
+        """Spark's progress reports for one output's query, a JSON line per batch, saved when a run of the job ends."""
+        return self.root / "_progress" / f"{output}.jsonl"
+
     def checkpoint(self, output: str) -> Path:
         return self.root / "_checkpoints" / output
 

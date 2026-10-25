@@ -14,7 +14,7 @@ import duckdb
 import pytest
 from confluent_kafka import Producer
 
-from flowcast.check import committed_batches, expected_rows, replay
+from flowcast.check import committed_batches, expected_rows, late_accounting, read_progress, replay
 from flowcast.generator import Config, sessions
 from flowcast.kafka_io import delete_topic, ensure_topic, produce, read_topic, wait_for_broker
 from flowcast.truth import Row, minute_aggregates, minute_aggregates_sql
@@ -57,7 +57,9 @@ def run(spark: Any, topic: str, out: Path, *, duckdb: bool = False) -> None:
     from flowcast.spark_job import kafka_records, start
 
     records = kafka_records(spark, BOOTSTRAP, topic, max_offsets_per_trigger=150)
-    start(spark, records, Paths(out), available_now=True, duckdb=duckdb).await_termination()
+    queries = start(spark, records, Paths(out), available_now=True, duckdb=duckdb)
+    queries.await_termination()
+    queries.save_progress(Paths(out))
 
 
 def test_the_job_writes_exactly_what_the_replay_of_its_batches_says(spark: Any, topic: str, tmp_path: Path) -> None:
@@ -79,6 +81,10 @@ def test_the_job_writes_exactly_what_the_replay_of_its_batches_says(spark: Any, 
     assert result.unread == 0 and result.invalid == len(BAD)
     assert result.watermark_errors == []  # the job ran with the specified 3-minute delay
     assert len(result.dropped) > 10, "the late rule was exercised"
+    # Spark's own metrics, per batch, against the replay: rows dropped as late and duplicates, at the dedupe.
+    accounting = late_accounting(read_progress(paths.progress("minute_aggregates")), result, batches)
+    assert accounting.ok, accounting.line()
+    assert accounting.batches == len(batches) and accounting.late == (len(result.dropped), len(result.dropped))
 
     written = sorted(
         Row(r.window_start, r.event_type, r.events, r.revenue_cents)
@@ -134,6 +140,7 @@ def test_the_cli_runs_the_job_checks_it_and_queries_it(topic: str, tmp_path: Pat
     assert check.returncode == 0, check.stdout + check.stderr
     assert check.stdout.splitlines()[-1] == "ok"
     assert f"raw_events: {len(events)} written, {len(events)} valid records read" in check.stdout
+    assert "late-data accounting over " in check.stdout and "batches with Spark's progress" in check.stdout
     # The backfill: published, then held to the truth of every raw record by the same check.
     backfill = subprocess.run([*cli, "backfill", "--out", str(out)], capture_output=True, text=True, timeout=300)
     assert backfill.returncode == 0, backfill.stderr[-8000:]

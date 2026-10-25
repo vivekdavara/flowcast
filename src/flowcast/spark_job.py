@@ -12,6 +12,7 @@ batch backfill) and the tests share one definition of "valid", "dedupe" and "win
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -39,6 +40,8 @@ WATERMARK_DELAY = f"{WATERMARK_DELAY_MS // 1000} seconds"
 STATE_PARTITIONS = 6
 # Spark keeps this many batches of its offset log; the replay check (check.py) needs every batch of a run.
 BATCHES_TO_RETAIN = 100_000
+# A progress report is a few kilobytes; at a 5-second trigger, 10,000 is about 14 hours of batches.
+PROGRESS_TO_KEEP = 10_000
 KAFKA_PACKAGE = f"org.apache.spark:spark-sql-kafka-0-10_2.13:{pyspark.__version__}"
 
 _INTEGER_FIELDS = {
@@ -66,6 +69,8 @@ def session(app: str = "flowcast", master: str = "local[*]", *, kafka: bool = Tr
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.shuffle.partitions", str(STATE_PARTITIONS))
         .config("spark.sql.streaming.minBatchesToRetain", str(BATCHES_TO_RETAIN))
+        # Each query keeps its last this-many progress reports for `save_progress` (Spark's default is 100).
+        .config("spark.sql.streaming.numRecentProgressUpdates", str(PROGRESS_TO_KEEP))
         # Parquet's standard timestamp (UTC microseconds) rather than Spark's legacy INT96 default.
         .config("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS")
         .config("spark.ui.enabled", "false")
@@ -196,6 +201,17 @@ class Queries:
     def stop(self) -> None:
         for query in self.all():
             query.stop()
+
+    def save_progress(self, paths: Paths) -> None:
+        """Append each query's progress reports (Spark's metrics per batch, `numRowsDroppedByWatermark` among them) to
+        `paths.progress(name)`, for the check's late-data accounting. Call it once the queries have ended: a run that
+        is killed saves none, and the check says which batches it has reports for."""
+        for query in self.all():
+            path = paths.progress(str(query.name))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as out:
+                for progress in query.recentProgress:
+                    out.write(json.dumps(json.loads(progress.json), separators=(",", ":")) + "\n")
 
 
 def kafka_records(

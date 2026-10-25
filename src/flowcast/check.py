@@ -73,6 +73,8 @@ class Replay:
     # Batches whose recorded watermark isn't the one the records before them give: the latest event time of every
     # valid record read in earlier batches minus the delay, never moving back. Empty when the job ran as specified.
     watermark_errors: list[str]
+    # Per batch id: (records dropped as late, kept records whose event_id was kept before: the dedupe's duplicates).
+    per_batch: dict[int, tuple[int, int]] = field(default_factory=dict)
 
 
 def replay(
@@ -96,7 +98,10 @@ def replay(
     late_watermark = 0  # batch 0 runs with no earlier watermark
     latest_event: int | None = None  # a running maximum, so the watermark it gives never moves back, as Spark's
     watermark_errors: list[str] = []
+    per_batch: dict[int, tuple[int, int]] = {}
+    seen: set[str] = set()  # event_ids kept so far: the dedupe's state holds each until it can't be late any more
     for batch in batches:
+        late_before, duplicates = len(dropped), 0
         expected_watermark = 0 if latest_event is None else latest_event - delay_ms
         if batch.watermark_ms != expected_watermark:
             watermark_errors.append(
@@ -112,20 +117,88 @@ def replay(
                 except InvalidEvent:
                     invalid += 1
                 else:
-                    (dropped if event.event_time <= late_watermark else kept).append(event)
+                    if event.event_time <= late_watermark:
+                        dropped.append(event)
+                    else:
+                        duplicates += event.event_id in seen
+                        seen.add(event.event_id)
+                        kept.append(event)
                     if batch.batch_id not in unobserved:
                         latest_event = event.event_time if latest_event is None else max(latest_event, event.event_time)
                 i += 1
             position[partition] = i
+        per_batch[batch.batch_id] = (len(dropped) - late_before, duplicates)
         late_watermark = batch.watermark_ms
     unread = sum(len(rs) - position[p] for p, rs in by_partition.items())
     last_watermark = batches[-1].watermark_ms if batches else 0
-    return Replay(kept, dropped, invalid, unread, last_watermark, watermark_errors)
+    return Replay(kept, dropped, invalid, unread, last_watermark, watermark_errors, per_batch)
 
 
 def expected_rows(result: Replay) -> list[Row]:
     """The rows the stream must have written: the truth of the kept records, in windows the watermark has passed."""
     return [row for row in minute_aggregates(result.kept) if row.window_start + WINDOW_MS <= result.watermark_ms]
+
+
+@dataclass(frozen=True)
+class LateAccounting:
+    """Spark's own counts against the replay's, over the batches Spark reported progress for (DESIGN.md "What the
+    metric can and can't do"). At the dedupe, numRowsDroppedByWatermark counts input rows dropped as late (every copy)
+    and numDroppedDuplicateRows the copies of an id it already held; the window aggregation after it should drop
+    nothing, since the dedupe already dropped every row its late filter would."""
+
+    batches: int  # batches compared: reported by Spark, not a skipped re-run (whose report counts nothing)
+    committed: int
+    late: tuple[int, int]  # (Spark's dedupe, the replay)
+    duplicates: tuple[int, int]  # (Spark's dedupe, the replay)
+    aggregate_late: int  # the window aggregation's numRowsDroppedByWatermark
+
+    @property
+    def ok(self) -> bool:
+        return self.late[0] == self.late[1] and self.duplicates[0] == self.duplicates[1] and self.aggregate_late == 0
+
+    def line(self) -> str:
+        return (
+            f"late-data accounting over {self.batches} of {self.committed} batches with Spark's progress: dropped as "
+            f"late {self.late[0]} (Spark) vs {self.late[1]} (replay), duplicates {self.duplicates[0]} vs "
+            f"{self.duplicates[1]}, dropped by the window aggregation {self.aggregate_late}: "
+            + ("equal" if self.ok else "DIFFERENT")
+        )
+
+
+def read_progress(path: Path) -> dict[int, dict[str, Any]]:
+    """A query's saved progress reports by batch id; the last report wins (a batch re-run after a crash reports
+    again). None of a killed run's are there."""
+    if not path.exists():
+        return {}
+    reports: dict[int, dict[str, Any]] = {}
+    for line in path.read_text().splitlines():
+        report = json.loads(line)
+        reports[int(report["batchId"])] = report
+    return reports
+
+
+def _operator(report: dict[str, Any], name: str) -> dict[str, Any]:
+    found: list[dict[str, Any]] = [op for op in report.get("stateOperators", []) if op.get("operatorName") == name]
+    if len(found) != 1:
+        raise CheckpointError(f"batch {report.get('batchId')}: expected one {name} operator, found {len(found)}")
+    return found[0]
+
+
+def late_accounting(
+    reports: dict[int, dict[str, Any]], result: Replay, batches: Sequence[Batch], skipped: Collection[int] = ()
+) -> LateAccounting:
+    compared = [b.batch_id for b in batches if b.batch_id in reports and b.batch_id not in skipped]
+    spark_late = spark_duplicates = aggregate_late = 0
+    for batch_id in compared:
+        dedupe = _operator(reports[batch_id], "dedupeWithinWatermark")
+        spark_late += int(dedupe["numRowsDroppedByWatermark"])
+        spark_duplicates += int(dedupe.get("customMetrics", {}).get("numDroppedDuplicateRows", 0))
+        aggregate_late += int(_operator(reports[batch_id], "stateStoreSave")["numRowsDroppedByWatermark"])
+    replay_late = sum(result.per_batch[i][0] for i in compared)
+    replay_duplicates = sum(result.per_batch[i][1] for i in compared)
+    return LateAccounting(
+        len(compared), len(batches), (spark_late, replay_late), (spark_duplicates, replay_duplicates), aggregate_late
+    )
 
 
 @dataclass(frozen=True)
@@ -153,6 +226,7 @@ class Report:
     # minute_aggregates batches a restart ran again after the file sink had logged them: skipped, not executed, so
     # their records didn't move the watermark (the replay leaves them out of it).
     skipped_reruns: list[int] = field(default_factory=list)
+    late: LateAccounting | None = None  # None when no progress was saved (every run killed)
 
     @property
     def ok(self) -> bool:
@@ -164,6 +238,7 @@ class Report:
             and (self.backfill is None or self.backfill[0] == self.backfill[1])
             and (self.duckdb is None or self.duckdb[0] == self.duckdb[1])
             and not self.duckdb_watermark_errors
+            and (self.late is None or self.late.ok)
         )
 
     def _duckdb_line(self) -> str:
@@ -203,6 +278,7 @@ class Report:
             *(f"  {problem}" for problem in r.watermark_errors[:10]),
             f"raw_events: {self.raw_events[0]} written, {self.raw_events[1]} valid records read",
             f"dead_letters: {self.dead_letters[0]} written, {self.dead_letters[1]} invalid records read",
+            self.late.line() if self.late is not None else "late-data accounting: no progress reports saved",
             f"restarts: {self.restarts} recorded; batches re-run after the sink logged them (their records didn't move "
             f"the watermark): {', '.join(map(str, self.skipped_reruns)) or 'none'}",
             self._duckdb_line(),
@@ -257,6 +333,7 @@ def check_run(bootstrap: str, topic: str, root: Path, timeout_s: float = 60.0) -
     starts = read_starts(paths)
     skipped = skipped_reruns(starts, "minute_aggregates")
     result = replay(records, per_query["minute_aggregates"], topic, unobserved=skipped)
+    reports = read_progress(paths.progress("minute_aggregates"))
     raw_read = replay(records, per_query["raw_events"], topic)
     dead_read = replay(records, per_query["dead_letters"], topic)
     # The DuckDB query's foreachBatch runs every batch, re-runs included, so its records all move its watermark.
@@ -284,6 +361,7 @@ def check_run(bootstrap: str, topic: str, root: Path, timeout_s: float = 60.0) -
         duckdb=None if duckdb_rows is None or duckdb_replay is None else (duckdb_rows, expected_rows(duckdb_replay)),
         duckdb_watermark_errors=[] if duckdb_replay is None else duckdb_replay.watermark_errors,
         restarts=len(starts),
+        late=late_accounting(reports, result, per_query["minute_aggregates"], skipped) if reports else None,
         skipped_reruns=sorted(skipped),
         backfill=None
         if current_backfill(paths) is None
