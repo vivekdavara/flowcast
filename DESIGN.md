@@ -21,6 +21,7 @@ flowchart LR
   S -->|"invalid"| DL["dead letters<br/>(Parquet)"]
   S -->|"valid, every record"| RAW["raw events<br/>(Parquet, by date)"]
   S -->|"dedupe + 1-min windows<br/>+ watermark"| AGG["minute aggregates<br/>(Parquet)"]
+  S -->|"same aggregate, foreachBatch<br/>(optional, day 3)"| DDB[("DuckDB sink<br/>rows + batch id, one transaction")]
   RAW --> B["batch backfill (day 3)<br/>same transformations"]
   B --> AGG2["exact aggregates"]
   RAW --> D["DuckDB views"]
@@ -32,14 +33,15 @@ flowchart LR
 Every arrow on the right of Kafka is day 2 or later. Day 1 builds the left side: the event schema, the generator and
 its ground truth, a local Kafka, the round trip through it, and CI.
 
-## The event (schema version 1)
+## The event (schema versions 1 and 2)
 
 One JSON object per Kafka record, UTF-8, compact (`,` and `:` separators, no spaces), keys always in the order below
-and always present (`null` where a field doesn't apply), so the same event is always the same bytes.
+and always present for the record's version (`null` where a field doesn't apply; version 1 has no `campaign` key), so
+the same event is always the same bytes.
 
 | Field | Type | Rule |
 |---|---|---|
-| `schema_version` | int | `1` |
+| `schema_version` | int | `1` or `2` |
 | `event_id` | string | 36-character lowercase UUID; unique per event, **the same on a re-sent copy** |
 | `event_type` | string | `page_view`, `product_view`, `add_to_cart`, `remove_from_cart`, `checkout`, `purchase` |
 | `event_time` | int | milliseconds since the Unix epoch, UTC, when the client says the event happened; 2000-01-01 ≤ t < 2100-01-01 |
@@ -52,6 +54,7 @@ and always present (`null` where a field doesn't apply), so the same event is al
 | `category` | string or null | lowercase letters and `_`, 1 to 32 characters; non-null exactly when `product_id` is |
 | `price_cents` | int or null | unit price, 1 to 10,000,000; non-null exactly when `product_id` is |
 | `quantity` | int or null | 1 to 99; non-null exactly for `add_to_cart`, `remove_from_cart`, `purchase` |
+| `campaign` | string or null | **version 2 only**, and optional there: 1 to 64 of `a-z0-9_-` (below) |
 
 Decisions:
 
@@ -64,6 +67,23 @@ Decisions:
 - **Unknown keys are refused in version 1.** Day 3's schema evolution adds version 2 with one optional field and
   readers that accept both; until then a stray key means a producer bug, and a dead letter is the right place for it.
 - **One purchase event per cart line**, so revenue by category needs no join.
+
+### Schema version 2 (day 3)
+
+Version 2 adds one optional field at the end, `campaign`: string or null, the marketing campaign the session came
+from, 1 to 64 of `a-z`, `0-9`, `_`, `-` (a utm_campaign tag). A version-2 record may leave the key out (read as null).
+
+- **The decoder reads both versions**: the record's `schema_version` decides the known keys, so version 1 keeps its
+  exact key set (`campaign` there is an unknown field, and a version-1 event with a campaign can't be encoded), and
+  version 3 is refused. Readers are upgraded first, then producers: a version-1 reader would dead-letter every
+  version-2 record ("schema_version must be 1"), which is visible and replayable, not silent.
+- **Bytes stay stable**: `encode` writes a version's own keys, so a version-1 event is the same bytes as before version 2
+  existed (the generator's pinned hash didn't move), and a version-2 event always writes `campaign`, null or not.
+- **The generator's version-2 mode** draws one campaign per session (60% none), only in that mode, so the version-1
+  stream is untouched.
+- **Parquet written before and after**: a job upgraded in place has raw files without the `campaign` column and files
+  with it. DuckDB's views read them with `union_by_name` (by position it refuses the mix); the backfill reads with the
+  raw schema given, so a missing column is null. The aggregates don't use the field, so they don't change.
 
 `src/flowcast/schema.py` holds the field list, the strict decoder (`decode`, which raises `InvalidEvent` with a
 reason) and the encoder (`encode`). The decoder is the reference for day 2's validation in Spark: a differential test
@@ -139,7 +159,10 @@ output is then checked against this truth:
 - **What the metric can and can't do.** `numRowsDroppedByWatermark` counts rows *at the operator*: input rows at
   the dedupe (a very late event sent twice counts twice), but partial aggregates (one per window and key per batch)
   at the window aggregation (five late events in one window can count once). So it's a cross-check of the dedupe's
-  input, against the replay's count of dropped records; it isn't an event count of the output.
+  input, against the replay's count of dropped records; it isn't an event count of the output. Day 3 makes it one,
+  batch by batch: the job saves its progress reports, and the check requires the dedupe's
+  `numRowsDroppedByWatermark` to equal the replay's late rows, its `numDroppedDuplicateRows` the kept records whose id
+  was kept before, and the window aggregation's drops to be 0. On every run so far all three are equal.
 - **The watermark delay is 3 minutes**, above the late cap (2 minutes plus the network delay), so late records are
   kept by design and very late ones (5 minutes or more) are dropped, except near the end of a finite stream: once the
   last on-time events are in, the maximum event time stops moving, and very late records of the last 3 minutes arrive
@@ -197,14 +220,53 @@ plain functions in `spark_job.py`, shared by the stream, the tests and day 3's b
   driver bound to 127.0.0.1 (otherwise it binds to the Wi-Fi address, since the Mac's hostname resolves to loopback).
   `flowcast stream` runs continuously (`--trigger` seconds) or `--available-now` (read what the topic holds, in as
   many batches as `--max-offsets` makes, then stop cleanly).
-- **Exactly once (day 3)**: the Kafka offsets of each micro-batch are in the checkpoint, and each sink must make a
-  replayed batch harmless. Spark's file sink only records a batch's files in its `_spark_metadata` log once the batch
-  commits, so a reader that globs the directory can see files from a batch that failed; readers use the log (or the
-  sink writes each batch to a directory named by its batch id and publishes it atomically). The DuckDB sink writes a
-  batch's rows and its batch id in one transaction and skips a batch id it has already committed.
-- **Late data, schema evolution and backfill (day 3)**: the dropped-row accounting above; version 2 of the event with
-  one new optional field, readers that accept both versions; a batch job over the raw Parquet that reuses the same
-  transformation functions as the stream (one definition of "valid", "dedupe" and "window").
+- **Exactly once (day 3)**: see the next section.
+- **Late data, schema evolution and backfill (day 3)**: the accounting above ("What the metric can and can't do");
+  version 2 of the event ("Schema version 2"); and the batch backfill, below.
+
+## Exactly once (day 3)
+
+A query's batch goes through three logs: Spark plans it (`offsets/<id>`: the Kafka end offsets and the watermark),
+the sink writes it and logs it (the file sink's `_spark_metadata/<id>`, or the DuckDB sink's transaction), and Spark
+commits it (`commits/<id>`). A crash can stop a batch between any two. On restart Spark runs an uncommitted batch again
+**with the offsets and watermark it planned** (not re-planned over what arrived since), so each sink has to make the
+second run harmless:
+
+- **The file sink** checks its own log: a batch id already there is skipped. A batch cut off before the sink logged it
+  leaves data files no log entry lists (orphans); the second run writes new files under new names. Readers never glob:
+  the views and the backfill read the log, and the check reports orphans (a glob would count their rows twice; a test
+  shows it).
+- **The DuckDB sink** (`duckdb_sink.py`, `flowcast stream --duckdb`): `foreachBatch` hands it each batch with its id;
+  it writes the rows and the id in one transaction and skips an id already there. Batch ids only identify a batch within
+  one checkpoint (a new one starts at 0 again), so the database is bound to the query id in the checkpoint's `metadata`
+  and refuses another query's batches; ids must arrive without a gap; a second row for a window violates its primary
+  key (append mode writes a window once), and the whole batch rolls back.
+- **Tested two ways.** `tests/test_recovery.py` puts a finished run back into each state a crash leaves (the commit
+  file removed with its `.crc`, and the sink's log entry or transaction too, or not), restarts, and requires the check
+  to pass. `flowcast.recovery` (and `scripts/kill_restart.py`) kills the running job with SIGKILL, the whole process
+  group, at random moments up to 2 s after it plans a batch, restarts it, and checks the result; it records where each
+  query's last batch was at each kill.
+- **What the kills found: a skipped re-run doesn't move the watermark.** When the file sink skips a re-run batch it
+  returns without executing it, so the batch's event times never reach Spark's watermark tracker: the next batch keeps
+  the re-run batch's watermark instead of the maximum event time of its records minus the delay. The output is still
+  exact (the drop rule uses the recorded watermarks), but the check's recomputation of each watermark failed one kill
+  run in three. Confirmed on the failing run: leaving that batch (and only it) out of the running maximum explains
+  every recorded watermark. The checkpoint doesn't say a batch was skipped, so the job writes it down: before starting
+  its queries, `start` appends each query's state (planned, logged, committed) to `<run>/_restarts.jsonl`; a file-sink
+  batch that was logged but not committed at a start is a skipped re-run, and the replay leaves its records out of the
+  watermark. A `foreachBatch` sink is always called and collects its frame, so the DuckDB query's watermark always
+  matches its records, and is checked without exceptions.
+
+## The batch backfill (day 3)
+
+`backfill.py` reads the raw sink's committed files and runs the stream's own `minute_aggregates` over them as a batch:
+one definition of "valid" (raw events are what `parse` kept), "dedupe" (`DEDUPE_KEY`) and "window" (`window_counts`).
+On a batch there's no watermark, so nothing is late and the result must equal the truth of every event, very late ones
+included; `flowcast check` holds it to the truth of every valid record the raw query read. Spark 4.2 refuses
+`dropDuplicatesWithinWatermark` on a batch DataFrame, so `deduplicated` uses `dropDuplicates` on the same key when its
+input isn't a stream. Each backfill writes a new directory and is published by replacing the `backfill/CURRENT`
+pointer with a rename: a reader sees the previous whole result or the new one, and a backfill that fails publishes
+nothing. DuckDB's `backfill_aggregates` view reads the published one.
 
 ## DuckDB
 
@@ -250,6 +312,6 @@ faster with the same bytes.
 |---|---|
 | 1 | This design; the event schema and its strict decoder; the generator with disorder, duplicates and determinism; the ground truth and its DuckDB twin; `scripts/kafka.sh`; topic creation, an idempotent producer and the snapshot reader; CI with a Kafka service container. |
 | 2 | A producer at volume (batching, pacing by arrival time, delivery accounting); the Spark job: parse and validate, dead letters, raw events, windowed aggregates with a watermark, Parquet; DuckDB views; Spark output checked against the truth. |
-| 3 | Exactly-once across a killed and restarted job (checkpoints, idempotent sinks); late-data accounting; schema version 2; the batch backfill sharing the transformations. |
+| 3 | Exactly-once across a killed and restarted job (checkpoints, the file sink's log, an idempotent DuckDB sink; crash states and real SIGKILLs; restarts recorded); late-data accounting against Spark's metrics; schema version 2; the batch backfill sharing the transformations. |
 | 4 | Benchmarks (events/s, end-to-end latency, trigger interval comparison); data-quality checks. |
 | 5 | A static HTML report; README with results; WALKTHROUGH.md; v1.0.0. |
