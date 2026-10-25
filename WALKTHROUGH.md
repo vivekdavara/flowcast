@@ -240,3 +240,66 @@ run failed while a review agent was killing processes, and I blamed a driver bin
 log said "bind to another address". That was only Spark's warning that it had picked the Wi-Fi address. The change
 (bind the driver to loopback) was still right, for a different reason, and the next commit's message corrects the
 record.
+
+## Exactly once, late data, schema version 2 and the backfill (day 3)
+
+Reading order for day 3: DESIGN.md "Exactly once", "The batch backfill", "Schema version 2" → `tests/test_recovery.py`
+(`cut_off_last_batch`, the test) → `src/flowcast/recovery.py` (`kill_and_restart`) → `src/flowcast/restarts.py` (its
+docstring is the day's finding) → `src/flowcast/check.py` (`replay`'s `unobserved`, `late_accounting`, `check_run`) →
+`src/flowcast/duckdb_sink.py` → `src/flowcast/backfill.py` and `spark_job.deduplicated` → `src/flowcast/schema.py`
+(`decode`, `wire_fields`).
+
+**How does the job get exactly-once output from Kafka?**
+Three pieces. The Kafka source is replayable: each batch's end offsets are written to the checkpoint's offset log
+before the batch runs, so after a crash Spark runs the uncommitted batch again over exactly the same records, with the
+same watermark. The state stores are versioned per batch, so the re-run starts from the state before it. And each sink
+makes a second run harmless: Spark's file sink skips a batch id already in its `_spark_metadata` log, and my DuckDB
+sink skips a batch id already in its table, checked in the same transaction that inserts the rows. Exactly once is
+"at least once from the source, idempotent at the sink". The proof is the replay: after any crash and restart, every
+output must still equal the replay of its own query's batches.
+
+**What happens if the job is killed in the middle of a batch?**
+It depends on how far the batch got. Planned but not written: the restart runs it again. Written but not logged: its
+data files stay in the directory as orphans, the restart writes the batch again under new file names, and readers never
+see the orphans because they read the sink's log, never a glob (the test shows a glob would count those rows twice).
+Logged but not committed: the restart runs it, and the sink skips it. `test_recovery.py` puts a finished run into the
+last two states by hand, and `recovery.py` kills the real process group with SIGKILL at random moments and records which
+state each query was in. Both then require `flowcast check` to pass.
+
+**Your kill test failed. What was wrong?**
+One run in three, the check said a batch's watermark was lower than the records before it give, while every output
+row was right. The kill had left `minute_aggregates`' batch 1 logged by the file sink but not committed. On restart,
+Spark ran batch 1 again, and the file sink saw it in its log and returned without executing the batch. So batch 1's
+event times never reached the watermark tracker, and batch 2 kept batch 1's watermark. I confirmed it on the failing
+run: leaving batch 1, and only batch 1, out of the replay's running maximum explains every recorded watermark. The
+checkpoint can't tell you a batch was skipped, so the job now writes each query's state to `_restarts.jsonl` before it
+starts, and the check uses that. The DuckDB query doesn't have the problem: `foreachBatch` is always called and my
+function collects the frame, which executes it.
+
+**Why bind the DuckDB sink to a query id?**
+Batch ids are only unique within one checkpoint. Delete the checkpoint, or start a second job against the same
+database, and the batch ids start at 0 again. A sink that only remembered "batch 0 done" would then skip the new
+query's first batches as already written, and lose them without an error. The sink records Spark's query id from the
+checkpoint's `metadata` file and refuses any other query's batches. It also refuses a gap in the ids, and the table's
+primary key on (window, type) refuses a second row for a window, which in append mode can only be a bug.
+
+**Can you trust `numRowsDroppedByWatermark`?**
+At the dedupe, yes, and day 3 checks it exactly. The job saves Spark's progress reports, and the check compares them
+batch by batch with the replay: the dedupe's `numRowsDroppedByWatermark` with the rows the replay drops as late (every
+copy), its `numDroppedDuplicateRows` with the kept records whose id was kept before, and the window aggregation's drops
+must be 0. They were equal in every compared batch. The limit is coverage: a killed run saves no reports, and a skipped
+re-run's report counts nothing, so the check says how many batches it compared.
+
+**How did you change the schema without breaking anything?**
+Version 2 adds one optional field at the end. The decoder reads the version first: version 1 keeps its exact key set,
+version 2 may carry `campaign` or leave it out. The encoder writes a version's own keys, so version-1 bytes didn't
+change (the generator's pinned hash held). Readers go first: a version-1 reader dead-letters version-2 records, which
+you'd notice and can replay. Then the stored data: raw Parquet written before the upgrade has no `campaign` column, so
+DuckDB's views read with `union_by_name` (by position it refuses the mix) and the backfill reads with the schema given.
+
+**How does the backfill reuse the stream's code, and what couldn't it reuse?**
+It calls the same `minute_aggregates` (dedupe, then `window_counts`) on a batch DataFrame of the raw events. One thing
+didn't carry over: Spark 4.2 refuses `dropDuplicatesWithinWatermark` on a batch, so `deduplicated` uses `dropDuplicates`
+on the same key when its input isn't a stream. The result must equal the truth of every event, very late ones included,
+and `flowcast check` holds it to that. It's published by writing a new directory and renaming a pointer file over
+`CURRENT`, so a reader sees a whole result or the previous one.
