@@ -11,11 +11,13 @@ from typing import Any
 import pytest
 
 from flowcast import backfill
+from flowcast.check import check_run
 from flowcast.generator import Config, sessions
 from flowcast.kafka_io import delete_topic, ensure_topic, produce, wait_for_broker
 from flowcast.layout import LayoutError, Paths, current_backfill
 from flowcast.schema import V1_FIELDS, Event, values
 from flowcast.truth import Row, minute_aggregates
+from flowcast.views import connect
 
 BOOTSTRAP = os.environ.get("FLOWCAST_TEST_BOOTSTRAP", "")
 CONFIG = Config(seed=31, sessions_per_second=0.2, late_fraction=0.2, very_late_fraction=0.05, duplicate_fraction=0.05)
@@ -104,10 +106,23 @@ def test_the_backfill_of_a_streamed_run_is_the_truth_very_late_events_included(
 ) -> None:
     from tests.test_spark_stream import run
 
-    events: list[Event] = [r.event for r in sessions(200, CONFIG)]
-    produce(BOOTSTRAP, topic, events)
+    # The producers upgrade to schema version 2 part way: the job reads both, and the backfill counts both.
+    v1: list[Event] = [r.event for r in sessions(120, CONFIG)]
+    v2: list[Event] = [r.event for r in sessions(120, dataclasses.replace(CONFIG, seed=33, schema_version=2))]
+    events = v1 + v2
+    produce(BOOTSTRAP, topic, v1)
+    produce(BOOTSTRAP, topic, v2)
     run(spark, topic, tmp_path)
     paths = Paths(tmp_path)
+    report = check_run(BOOTSTRAP, topic, tmp_path)
+    assert report.ok and report.replay.invalid == 0, "\n".join(report.lines())
+    con = connect(tmp_path)
+    try:
+        campaigns = dict(con.execute("SELECT event_id, campaign FROM raw_events").fetchall())
+    finally:
+        con.close()
+    assert {e.event_id: e.campaign for e in events} == campaigns and any(campaigns.values())
+
     first = backfill.run(spark, paths)
     truth = minute_aggregates(events)
     assert written(spark, first) == truth

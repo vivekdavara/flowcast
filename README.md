@@ -178,6 +178,7 @@ battery charging from 40%) while another Claude Code session (the other portfoli
 | Late-data accounting | over the 33 of 42 batches with Spark's progress saved (killed runs save none; the skipped re-run is left out): **Spark's dedupe dropped 1,267 rows as late, the replay 1,267; duplicates 71 and 71**; the window aggregation dropped 0 | same |
 | Rows dropped as late | 1,280 of 11,966 valid records in that run, against 55 of 39,346 in day 2's run at 2,000 records a batch; the replay agrees exactly either way. Why small batches over a backlog drop so many more is for day 4's batch-size comparison | same; day 2's demo |
 | Its length | 266 s for all 11 rounds (each restart starts a JVM and Spark); 82 s for the last, uninterrupted one | same |
+| The backfill of that run | **523 rows, equal to the truth of every raw record** (11,858 distinct events, very late ones included); the stream had written fewer events than the backfill in 234 of its 494 rows (1,263 events). 30.8 s at load average 37, Spark's start included; its first stage had 246 tasks, one per raw file: small batches make small files (day 4) | `.venv/bin/flowcast backfill --out data/kill-d3`, then `flowcast check --topic kill-d3 --out data/kill-d3` (ok, every line equal) |
 
 The tests' runs (`test_recovery.py`, `test_kill.py`, `test_backfill.py`, `test_spark_stream.py`) check the same things on
 smaller streams on every `make check` and in CI; the backfill there equals the truth of every event exactly.
@@ -206,8 +207,8 @@ smaller streams on every `make check` and in CI; the backfill there equals the t
 - `tests/test_spark_rules.py` (Spark): the late-row rules on the job's own functions, one file per batch: the previous
   batch's watermark, inclusive, for the dedupe and the windows; the dedupe's state is evicted; revenue only for
   purchases.
-- `tests/test_spark_parse.py` (Spark): `parse` gives `decode`'s verdict and reason on 170 records (150 generated, 20
-  bad); the dead letter and raw event split, columns and dates.
+- `tests/test_spark_parse.py` (Spark): `parse` gives `decode`'s verdict and reason on 257 records (234 good, 84 of them
+  version 2; 23 bad); the dead letter and raw event split, columns and dates.
 - `tests/test_spark_stream.py` (Kafka and Spark): 300 thin sessions (20% late, 5% very late, 5% duplicates) and four bad
   records through two runs of the job at 150 records a batch; the aggregates must equal the replay row for row, with
   watermarks as specified and more than 10 records dropped; raw events and dead letters reconcile; the DuckDB views

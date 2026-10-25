@@ -182,7 +182,7 @@ Because there should be one definition of "valid", and `from_json` isn't it. I t
 "e":NaN}` it keeps the last `a`, ignores the unknown `z`, and reads `NaN` as a number, all things `decode` refuses on
 purpose. Matching `decode` in Spark SQL would mean re-implementing duplicate-key and token-level checks that
 `from_json` doesn't expose. So `parse` calls `decode` in an Arrow UDF, and `test_spark_parse.py` holds it to
-`decode`'s exact verdict and reason on 170 records (150 generated, 20 bad). The cost is a Python call per record,
+`decode`'s exact verdict and reason on 257 records (234 good, 84 of them version 2 since day 3; 23 bad). The cost is a Python call per record,
 which day 4 measures; if it matters, the fallback is native checks for the common path with the UDF only for what they
 can't decide.
 
