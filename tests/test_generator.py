@@ -7,6 +7,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from flowcast.generator import (
+    CAMPAIGNS,
     DEFAULT_START_MS,
     NETWORK_MAX_MS,
     NETWORK_MIN_MS,
@@ -298,3 +299,27 @@ def test_an_event_at_exactly_2100_is_refused_too() -> None:
     session.time_ms = MAX_EVENT_TIME - 1
     generator._emit(session, "page_view", "/", None, None)
     assert encode(generator._pending[0][2].event)
+
+
+def test_version_2_gives_each_session_one_campaign_and_round_trips() -> None:
+    records = sessions(2_000, Config(seed=5, schema_version=2))
+    by_session: dict[str, set[str | None]] = {}
+    for record in records:
+        assert record.event.schema_version == 2
+        assert decode(encode(record.event)) == record.event
+        by_session.setdefault(record.event.session_id, set()).add(record.event.campaign)
+    assert all(len(campaigns) == 1 for campaigns in by_session.values())
+    drawn = [next(iter(c)) for c in by_session.values()]
+    assert set(drawn) == {c for c, _ in CAMPAIGNS}
+    # 60% of sessions have no campaign: 2,000 draws put the share within a few points of it.
+    assert 0.55 < drawn.count(None) / len(drawn) < 0.65
+
+
+def test_version_2_changes_only_what_comes_after_the_campaign_draws() -> None:
+    # Same users and catalog (drawn before any session), the same first session start; the extra draw per session
+    # moves the rest, so the version-1 stream itself is untouched (the pinned hash) rather than reproduced.
+    v1 = sessions(1, Config(seed=9))
+    v2 = sessions(1, Config(seed=9, schema_version=2))
+    assert v1[0].event.user_id == v2[0].event.user_id and v1[0].event.event_time == v2[0].event.event_time
+    with pytest.raises(ValueError, match="schema_version must be 1 or 2"):
+        Config(schema_version=3)

@@ -31,6 +31,16 @@ def test_generate_writes_the_wire_form_of_whole_sessions(tmp_path: Path) -> None
     assert out.read_bytes() == expected
 
 
+def test_generate_writes_schema_version_2_when_asked(tmp_path: Path) -> None:
+    out = tmp_path / "events.jsonl"
+    assert main(["generate", "--sessions", "30", "--seed", "3", "--schema-version", "2", "--out", str(out)]) == 0
+    expected = b"".join(encode(r.event) + b"\n" for r in sessions(30, Config(seed=3, schema_version=2)))
+    assert out.read_bytes() == expected
+    assert all(line.startswith(b'{"schema_version":2,') and b',"campaign":' in line for line in expected.splitlines())
+    with pytest.raises(SystemExit):
+        main(["generate", "--records", "1", "--schema-version", "3"])
+
+
 def test_generate_records_is_a_prefix_of_the_endless_stream(capfdbinary: pytest.CaptureFixture[bytes]) -> None:
     assert main(["generate", "--records", "20"]) == 0
     assert capfdbinary.readouterr().out == b"".join(encode(r.event) + b"\n" for r in take(20))

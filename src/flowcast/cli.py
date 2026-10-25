@@ -80,6 +80,9 @@ def _stream_options(parser: argparse.ArgumentParser, *, from_file: bool = False)
     parser.add_argument("--duplicate-fraction", type=float, default=Config.duplicate_fraction)
     parser.add_argument("--late-fraction", type=float, default=Config.late_fraction)
     parser.add_argument("--very-late-fraction", type=float, default=Config.very_late_fraction)
+    parser.add_argument(
+        "--schema-version", type=int, choices=(1, 2), default=1, help="2 adds a campaign per session (default 1)"
+    )
 
 
 def _kafka_options(parser: argparse.ArgumentParser) -> None:
@@ -144,6 +147,7 @@ def _config(args: argparse.Namespace) -> Config:
             duplicate_fraction=args.duplicate_fraction,
             late_fraction=args.late_fraction,
             very_late_fraction=args.very_late_fraction,
+            schema_version=args.schema_version,
         )
     except ValueError as exc:
         raise UsageError(str(exc)) from exc

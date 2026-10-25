@@ -44,6 +44,13 @@ COUNTRIES: tuple[tuple[str, float], ...] = (
 )
 DEVICES = (("mobile", 0.6), ("desktop", 0.32), ("tablet", 0.08))
 LANDING_PAGES = ("/", "/search", "/deals")
+# Schema version 2: the campaign a session came from (None: no campaign), drawn once per session.
+CAMPAIGNS: tuple[tuple[str | None, float], ...] = (
+    (None, 0.6),
+    ("spring_sale", 0.2),
+    ("newsletter", 0.12),
+    ("retargeting-2026", 0.08),
+)
 
 # Network delay of every event, in ms; late and very late events add to it.
 NETWORK_MIN_MS = 5
@@ -72,6 +79,9 @@ class Config:
     very_late_max_ms: int = 1_800_000
     duplicate_fraction: float = 0.01
     max_session_events: int = 60
+    # 1 writes the original events; 2 adds a campaign per session. Version 1 makes no campaign draw, so its stream is
+    # the same bytes as before version 2 existed (the pinned hash holds).
+    schema_version: int = 1
 
     def __post_init__(self) -> None:
         if self.seed < 0:
@@ -96,6 +106,8 @@ class Config:
             raise ValueError("very_late_min_ms must be between 0 and very_late_max_ms")
         if self.max_session_events < 1:
             raise ValueError("max_session_events must be at least 1")
+        if self.schema_version not in (1, 2):
+            raise ValueError("schema_version must be 1 or 2")
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +177,7 @@ class _Session:
     session_id: str
     user: _User
     time_ms: int
+    campaign: str | None = None
     product: _Product | None = None
     cart: dict[str, tuple[_Product, int]] = field(default_factory=dict)
 
@@ -230,6 +243,8 @@ class Generator:
 
     def _session(self, start: int) -> None:
         session = _Session(f"s{self._sessions}", self._users[self._draw.skewed(len(self._users))], start)
+        if self.config.schema_version == 2:
+            session.campaign = self._draw.weighted(CAMPAIGNS)
         self._sessions += 1
         event_type: str | None = "page_view"
         emitted = 0
@@ -289,7 +304,7 @@ class Generator:
         digest = hashlib.blake2b(f"{config.seed}:{self._events}".encode(), digest_size=16).digest()
         self._events += 1
         event = Event(
-            schema_version=1,
+            schema_version=config.schema_version,
             event_id=str(uuid.UUID(bytes=digest, version=4)),
             event_type=event_type,
             event_time=session.time_ms,
@@ -302,6 +317,7 @@ class Generator:
             category=product.category if product else None,
             price_cents=product.price_cents if product else None,
             quantity=quantity,
+            campaign=session.campaign,
         )
         arrival = event.event_time + self._draw.between(NETWORK_MIN_MS, NETWORK_MAX_MS)
         u = self._draw.uniform()

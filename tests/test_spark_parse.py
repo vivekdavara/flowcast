@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from flowcast.generator import sessions
+from flowcast.generator import Config, sessions
 from flowcast.schema import FIELDS, InvalidEvent, decode, encode
 from flowcast.spark_job import safe_reason
 from tests.test_schema import make, raw
@@ -18,6 +18,8 @@ KAFKA_SCHEMA = "value BINARY, topic STRING, partition INT, offset BIGINT, timest
 
 def records() -> list[bytes | None]:
     good = [encode(r.event) for r in sessions(40)]
+    good += [encode(r.event) for r in sessions(20, Config(seed=2, schema_version=2))]
+    good.append(raw(make(schema_version=2)).replace(b', "campaign": null', b""))  # version 2 leaving campaign out
     bad: list[bytes | None] = [
         None,  # a tombstone
         b"",
@@ -39,6 +41,9 @@ def records() -> list[bytes | None]:
         encode(make()).replace(b'"quantity":2', b'"quantity":true'),
         b'{"\\ud800":1,"\\ud800":2}',  # the reason quotes a key that is a lone surrogate (day-2 review)
         encode(make())[:-1] + b',"\\udfff":1}',
+        raw(make(), campaign="spring_sale"),  # campaign in a version-1 record
+        raw(make(schema_version=2), campaign="Spring Sale"),
+        raw(make(schema_version=3)),
     ]
     return good + bad
 
@@ -61,8 +66,8 @@ def test_parse_gives_decodes_verdict_and_reason_for_every_record(spark: Any) -> 
     for row, value in zip(rows, values, strict=True):
         assert tuple(row[name] for name in ("error", *FIELDS)) == verdict(value), value
         assert (row.value is None and value is None) or bytes(row.value) == value
-    assert sum(r.error is not None for r in rows) == 20
-    assert rows[-2].error == "duplicate field \\ud800"
+    assert sum(r.error is not None for r in rows) == 23
+    assert rows[values.index(b'{"\\ud800":1,"\\ud800":2}')].error == "duplicate field \\ud800"
 
 
 def test_dead_letters_and_raw_events_split_the_records(spark: Any) -> None:

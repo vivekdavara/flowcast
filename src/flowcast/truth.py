@@ -21,7 +21,8 @@ WINDOW_MS = 60_000
 # The streaming job's watermark delay: above the generator's late cap, below its very late minimum (DESIGN.md).
 WATERMARK_DELAY_MS = 180_000
 
-# DuckDB column types for the version-1 fields, so read_json never guesses (a column of nulls would become JSON).
+# DuckDB column types for the event's fields (version 2's), so read_json never guesses (a column of nulls would
+# become JSON).
 DUCKDB_COLUMNS = {
     "schema_version": "INTEGER",
     "event_id": "VARCHAR",
@@ -36,6 +37,7 @@ DUCKDB_COLUMNS = {
     "category": "VARCHAR",
     "price_cents": "BIGINT",
     "quantity": "INTEGER",
+    "campaign": "VARCHAR",  # version 2; null in version 1
 }
 
 

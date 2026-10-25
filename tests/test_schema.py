@@ -8,15 +8,16 @@ from hypothesis import strategies as st
 
 from flowcast.schema import (
     EVENT_TYPES,
-    FIELDS,
     MAX_EVENT_TIME,
     MIN_EVENT_TIME,
     PRODUCT_TYPES,
     QUANTITY_TYPES,
+    V1_FIELDS,
     Event,
     InvalidEvent,
     decode,
     encode,
+    wire_fields,
 )
 
 
@@ -41,7 +42,8 @@ def make(event_type: str = "purchase", **changes: Any) -> Event:
 
 
 def raw(event: Event, **changes: Any) -> bytes:
-    obj = dict(zip(FIELDS, dataclasses.astuple(event), strict=True))
+    """The event as a JSON object with its version's keys, changed: a way to write records encode would refuse."""
+    obj = {name: getattr(event, name) for name in wire_fields(event.schema_version)}
     obj.update(changes)
     return json.dumps(obj).encode()
 
@@ -69,7 +71,7 @@ def test_revenue_is_price_times_quantity_for_purchases_only() -> None:
 
 def test_key_order_on_the_wire_does_not_matter_to_the_decoder() -> None:
     event = make()
-    obj = dict(reversed(list(zip(FIELDS, dataclasses.astuple(event), strict=True))))
+    obj = dict(reversed(list(zip(V1_FIELDS, dataclasses.astuple(event), strict=False))))
     assert decode(json.dumps(obj).encode()) == event
 
 
@@ -122,7 +124,8 @@ def test_non_json_constants_are_refused(constant: str) -> None:
 @pytest.mark.parametrize(
     ("changes", "reason"),
     [
-        ({"schema_version": 2}, "schema_version"),
+        ({"schema_version": 3}, "schema_version"),
+        ({"schema_version": 0}, "schema_version"),
         ({"schema_version": True}, "schema_version"),
         ({"schema_version": 1.0}, "schema_version"),
         ({"event_id": "0F8FAD5B-D9CB-469F-A165-70867728950E"}, "bad event_id"),
@@ -239,3 +242,54 @@ def test_a_record_with_no_value_is_invalid_not_a_type_error() -> None:
     # A Kafka tombstone has no value (Record.value is None); day 2 makes it a dead letter like any bad record.
     with pytest.raises(InvalidEvent, match="no value"):
         decode(None)
+
+
+# Schema version 2 (day 3): one optional field, campaign.
+
+
+def test_a_version_2_event_round_trips_with_and_without_a_campaign() -> None:
+    for campaign in ("spring_sale-2026", None):
+        event = make(schema_version=2, campaign=campaign)
+        value = encode(event)
+        assert value.endswith(b'"quantity":2,"campaign":' + json.dumps(campaign).encode() + b"}")
+        assert decode(value) == event
+
+
+def test_version_2_may_leave_the_campaign_out() -> None:
+    value = raw(make(schema_version=2))
+    assert b"campaign" in value
+    obj = json.loads(value)
+    del obj["campaign"]
+    assert decode(json.dumps(obj).encode()) == make(schema_version=2)
+
+
+def test_version_1_bytes_are_unchanged_and_know_no_campaign() -> None:
+    assert b"campaign" not in encode(make())
+    with pytest.raises(InvalidEvent, match="unknown field campaign"):
+        decode(raw(make(), campaign=None))
+    with pytest.raises(InvalidEvent, match="campaign is a version-2 field"):
+        encode(make(campaign="spring_sale"))
+
+
+def test_a_version_2_record_still_needs_every_version_1_field_and_no_others() -> None:
+    obj = json.loads(raw(make(schema_version=2)))
+    del obj["page"]
+    with pytest.raises(InvalidEvent, match="missing field page"):
+        decode(json.dumps(obj).encode())
+    with pytest.raises(InvalidEvent, match="unknown field referrer"):
+        decode(raw(make(schema_version=2), referrer="/home"))
+
+
+@pytest.mark.parametrize("campaign", ["Spring", "", "a" * 65, "spring sale", "été", 7, True])
+def test_a_bad_campaign_is_refused(campaign: object) -> None:
+    with pytest.raises(InvalidEvent, match="bad campaign"):
+        decode(raw(make(schema_version=2), campaign=campaign))
+    assert decode(raw(make(schema_version=2), campaign="a" * 64)).campaign == "a" * 64
+
+
+@given(events, st.sampled_from([None, "newsletter", "x"]))
+def test_any_valid_version_2_event_round_trips_byte_for_byte(event: Event, campaign: str | None) -> None:
+    event = dataclasses.replace(event, schema_version=2, campaign=campaign)
+    value = encode(event)
+    assert decode(value) == event
+    assert encode(decode(value)) == value
