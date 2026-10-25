@@ -29,7 +29,7 @@ pytestmark = [
 ]
 
 CONFIG = Config(seed=23, sessions_per_second=0.2, late_fraction=0.2, very_late_fraction=0.05, duplicate_fraction=0.05)
-QUERIES = ("dead_letters", "raw_events", "minute_aggregates")
+QUERIES = ("dead_letters", "raw_events", "minute_aggregates", "duckdb_aggregates")
 
 
 @pytest.fixture
@@ -67,7 +67,12 @@ def cut_off_last_batch(paths: Paths, name: str, *, logged: bool) -> tuple[int, s
     checkpoint = paths.checkpoint(name)
     last = committed_batches(checkpoint)[-1].batch_id
     unwrite(checkpoint / "commits" / str(last))
-    if not logged:
+    if not logged and name == "duckdb_aggregates":
+        # A crash before the sink's transaction committed leaves neither the batch's rows nor its id.
+        with duckdb.connect(str(paths.duckdb)) as con:
+            con.execute("DELETE FROM minute_aggregates WHERE batch_id = ?", [last])
+            con.execute("DELETE FROM sink_batches WHERE batch_id = ?", [last])
+    elif not logged:
         unwrite(log_entry(sink_of(paths, name), last))
     return last, (checkpoint / "offsets" / str(last)).read_text()
 
@@ -80,7 +85,7 @@ def test_a_batch_cut_off_before_its_commit_runs_again_exactly_once(
     half = len(events) // 2
     produce(BOOTSTRAP, topic, events[:half])
     produce_raw(topic, BAD)
-    run(spark, topic, tmp_path)
+    run(spark, topic, tmp_path, duckdb=True)
     paths = Paths(tmp_path)
     cut = {name: cut_off_last_batch(paths, name, logged=logged) for name in QUERIES}
 
@@ -95,11 +100,16 @@ def test_a_batch_cut_off_before_its_commit_runs_again_exactly_once(
         assert early.orphans["raw_events"] > 0 and early.orphans["dead_letters"] > 0
 
     produce(BOOTSTRAP, topic, events[half:])
-    run(spark, topic, tmp_path)  # the restart: the cut-off batch first, then the new records
+    run(spark, topic, tmp_path, duckdb=True)  # the restart: the cut-off batch first, then the new records
 
     report = check_run(BOOTSTRAP, topic, tmp_path)
-    assert report.ok, report.lines()
+    assert report.ok, "\n".join(report.lines())
     assert report.replay.unread == 0 and report.replay.invalid == len(BAD)
+    # The second start recorded where each query stood; a batch the file sink had logged was skipped on its re-run.
+    assert report.restarts == 2
+    assert report.skipped_reruns == ([cut["minute_aggregates"][0]] if logged else [])
+    # The DuckDB sink: each batch once (its rows equal the replay of its own query, so nothing doubled).
+    assert report.duckdb is not None and report.duckdb[0] == report.duckdb[1] and len(report.duckdb[0]) > 20
     for name, (batch_id, offsets) in cut.items():
         # The batch ran again as it was planned, not re-planned over what had arrived since.
         assert (paths.checkpoint(name) / "offsets" / str(batch_id)).read_text() == offsets
@@ -117,7 +127,7 @@ def test_a_batch_cut_off_before_its_commit_runs_again_exactly_once(
     orphans = orphan_files(paths.raw_events)
     if logged:
         # The file sink saw the batch in its log and skipped it: nothing written twice.
-        assert orphans == [] and report.orphans == {name: 0 for name in QUERIES}
+        assert orphans == [] and report.orphans == {name: 0 for name in QUERIES[:3]}
     else:
         # The batch was written again under new names. Its first files are still there, and a glob of the directory
         # (what the views never do) counts their records twice.

@@ -327,3 +327,16 @@ def test_check_run_holds_a_published_backfill_to_the_truth_of_every_raw_record(t
     report = check_run("unused", TOPIC, tmp_path)
     assert "backfill: 3 rows, 4 in the truth of every raw record: 1 missing, 0 unexpected" in report.lines()
     assert not report.ok
+
+
+def test_a_skipped_reruns_records_dont_move_the_recomputed_watermark() -> None:
+    # Batch 1 re-ran after a crash with its output already logged: the file sink skipped it, so batch 2's watermark
+    # is still batch 1's. Without being told, the recomputation expects batch 1's records to have moved it.
+    records = [rec(0, 0, ev(1, T0)), rec(0, 1, ev(2, T0 + 60_000)), rec(0, 2, ev(3, T0 + 1))]
+    batches = [batch(0, 0, p0=1), batch(1, T0 - 180_000, p0=2), batch(2, T0 - 180_000, p0=3)]
+    assert replay(records, batches, TOPIC).watermark_errors == [
+        f"batch 2: watermark {T0 - 180_000}, expected {T0 - 120_000}"
+    ]
+    assert replay(records, batches, TOPIC, unobserved={1}).watermark_errors == []
+    # Only that batch: told the wrong one, the recomputation still finds the difference.
+    assert replay(records, batches, TOPIC, unobserved={0}).watermark_errors != []

@@ -13,7 +13,7 @@ from flowcast.check import check_run
 from flowcast.generator import Config, sessions
 from flowcast.kafka_io import delete_topic, ensure_topic, produce, wait_for_broker
 from flowcast.layout import Paths
-from flowcast.recovery import QUERIES, QueryState, kill_and_restart, query_state
+from flowcast.recovery import DUCKDB_QUERY, QUERIES, QueryState, kill_and_restart, query_state
 from flowcast.views import connect
 
 BOOTSTRAP = os.environ.get("FLOWCAST_TEST_BOOTSTRAP", "")
@@ -65,15 +65,23 @@ def test_killed_and_restarted_the_job_is_still_exact(topic: str, tmp_path: Path)
     produce(BOOTSTRAP, topic, events)
     out = tmp_path / "run"
     outcome = kill_and_restart(
-        BOOTSTRAP, topic, out, kills=3, max_offsets=40, rng=random.Random(3), log=tmp_path / "stream.log"
+        BOOTSTRAP,
+        topic,
+        out,
+        kills=3,
+        max_offsets=40,
+        rng=random.Random(3),
+        log=tmp_path / "stream.log",
+        duckdb=True,
     )
     assert len(outcome.kills) + outcome.finished_early == 3
     assert outcome.kills, "at least one kill landed while the job ran"
-    assert all(set(kill.states) == set(QUERIES) for kill in outcome.kills)
+    assert all(set(kill.states) == {*QUERIES, DUCKDB_QUERY} for kill in outcome.kills)
 
     report = check_run(BOOTSTRAP, topic, out)
-    assert report.ok, report.lines()
+    assert report.ok, "\n".join(report.lines())
     assert report.replay.unread == 0 and len(report.replay.dropped) > 0
+    assert report.duckdb is not None and report.duckdb[0] == report.duckdb[1]
     con = connect(out)
     try:
         counts = con.execute('SELECT count(*), count(DISTINCT (partition, "offset")) FROM raw_events').fetchone()

@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,12 +23,15 @@ import pyspark
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.streaming.query import StreamingQuery
+from pyspark.sql.streaming.readwriter import DataStreamWriter
 from pyspark.sql.types import IntegerType, LongType, StringType, StructField, StructType
 
+from flowcast.duckdb_sink import DuckDBSink
 from flowcast.kafka_io import TOPIC
 from flowcast.layout import Paths
+from flowcast.restarts import DUCKDB_QUERY, FILE_SINK_QUERIES, record_start
 from flowcast.schema import FIELDS, InvalidEvent, decode, values
-from flowcast.truth import WATERMARK_DELAY_MS
+from flowcast.truth import WATERMARK_DELAY_MS, Row
 
 WATERMARK_DELAY = f"{WATERMARK_DELAY_MS // 1000} seconds"
 # The stateful operators' state is split into this many partitions. It is fixed for the life of a checkpoint, and
@@ -161,14 +165,29 @@ def minute_aggregates(events: DataFrame, delay: str = WATERMARK_DELAY) -> DataFr
     return window_counts(deduplicated(events, delay))
 
 
+def write_batches(sink: DuckDBSink) -> Callable[[DataFrame, int], None]:
+    """A foreachBatch function: each micro-batch's aggregate rows into the idempotent DuckDB sink. A batch's rows are
+    the windows the watermark closed in it, a handful, so they're collected to the driver."""
+
+    def write(frame: DataFrame, batch_id: int) -> None:
+        rows = [
+            Row(int(r.window_start), str(r.event_type), int(r.events), int(r.revenue_cents)) for r in frame.collect()
+        ]
+        sink.write(batch_id, rows)
+
+    return write
+
+
 @dataclass(frozen=True)
 class Queries:
     dead_letters: StreamingQuery
     raw_events: StreamingQuery
     minute_aggregates: StreamingQuery
+    duckdb_aggregates: StreamingQuery | None = None  # only when the job runs with the DuckDB sink
 
     def all(self) -> tuple[StreamingQuery, ...]:
-        return (self.dead_letters, self.raw_events, self.minute_aggregates)
+        core = (self.dead_letters, self.raw_events, self.minute_aggregates)
+        return core if self.duckdb_aggregates is None else (*core, self.duckdb_aggregates)
 
     def await_termination(self) -> None:
         for query in self.all():
@@ -204,34 +223,43 @@ def start(
     trigger_s: float = 5.0,
     available_now: bool = False,
     delay: str = WATERMARK_DELAY,
+    duckdb: bool = False,
 ) -> Queries:
     """Start the three queries over `records` (a Kafka stream, or anything with its columns), writing under `paths`.
 
     A batch starts every `trigger_s` seconds (at once if the last one took longer). With `available_now`, the queries
-    instead read what is there when they start, in as many batches as the offset cap makes, and then stop.
+    instead read what is there when they start, in as many batches as the offset cap makes, and then stop. With
+    `duckdb`, a fourth query writes the minute aggregates into the idempotent DuckDB sink (`paths.duckdb`).
     """
     if not math.isfinite(trigger_s) or trigger_s < 0:
         raise ValueError("trigger_s must be a finite number of seconds, at least 0")
     interval = f"{round(trigger_s * 1000)} milliseconds"
     parsed = parse(records)
 
-    def sink(frame: DataFrame, name: str, out: Path, partition_by: tuple[str, ...] = ()) -> StreamingQuery:
-        writer = (
-            frame.writeStream.queryName(name)
-            .format("parquet")
-            .option("path", str(out))
-            .option("checkpointLocation", str(paths.checkpoint(name)))
-            .outputMode("append")
-        )
-        writer = writer.trigger(availableNow=True) if available_now else writer.trigger(processingTime=interval)
-        if partition_by:
-            writer = writer.partitionBy(*partition_by)
-        return writer.start()
+    def writer(frame: DataFrame, name: str) -> DataStreamWriter:
+        stream = frame.writeStream.queryName(name).option("checkpointLocation", str(paths.checkpoint(name)))
+        stream = stream.outputMode("append")
+        return stream.trigger(availableNow=True) if available_now else stream.trigger(processingTime=interval)
 
+    def sink(frame: DataFrame, name: str, out: Path, partition_by: tuple[str, ...] = ()) -> StreamingQuery:
+        stream = writer(frame, name).format("parquet").option("path", str(out))
+        if partition_by:
+            stream = stream.partitionBy(*partition_by)
+        return stream.start()
+
+    # Before anything starts: where each query stands, which is how the check knows a batch was skipped on a re-run.
+    record_start(paths, (*FILE_SINK_QUERIES, *([DUCKDB_QUERY] if duckdb else [])))
+    duckdb_query = None
+    if duckdb:
+        to_duckdb = write_batches(DuckDBSink(paths.duckdb, paths.checkpoint("duckdb_aggregates")))
+        duckdb_query = (
+            writer(minute_aggregates(raw_events(parsed), delay), "duckdb_aggregates").foreachBatch(to_duckdb).start()
+        )
     return Queries(
         dead_letters=sink(dead_letters(parsed), "dead_letters", paths.dead_letters),
         raw_events=sink(raw_events(parsed), "raw_events", paths.raw_events, ("event_date",)),
         minute_aggregates=sink(
             minute_aggregates(raw_events(parsed), delay), "minute_aggregates", paths.minute_aggregates
         ),
+        duckdb_aggregates=duckdb_query,
     )

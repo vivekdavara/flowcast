@@ -130,6 +130,9 @@ def build_parser() -> argparse.ArgumentParser:
     stream.add_argument("--trigger", type=_seconds, default=5.0, help="seconds between batches (default %(default)s)")
     stream.add_argument("--max-offsets", type=_positive, help="at most this many records a batch")
     stream.add_argument("--available-now", action="store_true", help="read what the topic holds now, then stop")
+    stream.add_argument(
+        "--duckdb", action="store_true", help="also write the minute aggregates to the idempotent DuckDB sink"
+    )
 
     check = sub.add_parser("check", help="check a stopped run's outputs exactly against the records in the topic")
     _kafka_options(check)
@@ -242,7 +245,14 @@ def _stream(args: argparse.Namespace) -> None:
     spark.sparkContext.setLogLevel("WARN")
     try:
         records = kafka_records(spark, args.bootstrap, args.topic, max_offsets_per_trigger=args.max_offsets)
-        queries = start(spark, records, Paths(args.out), trigger_s=args.trigger, available_now=args.available_now)
+        queries = start(
+            spark,
+            records,
+            Paths(args.out),
+            trigger_s=args.trigger,
+            available_now=args.available_now,
+            duckdb=args.duckdb,
+        )
         try:
             if args.available_now:
                 queries.await_termination()

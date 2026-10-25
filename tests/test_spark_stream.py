@@ -51,13 +51,13 @@ def produce_raw(topic: str, values: list[bytes]) -> None:
     assert producer.flush(30) == 0
 
 
-def run(spark: Any, topic: str, out: Path) -> None:
+def run(spark: Any, topic: str, out: Path, *, duckdb: bool = False) -> None:
     """One run of the job over what's in the topic now, 150 records a batch, resuming from its checkpoints."""
     from flowcast.layout import Paths
     from flowcast.spark_job import kafka_records, start
 
     records = kafka_records(spark, BOOTSTRAP, topic, max_offsets_per_trigger=150)
-    start(spark, records, Paths(out), available_now=True).await_termination()
+    start(spark, records, Paths(out), available_now=True, duckdb=duckdb).await_termination()
 
 
 def test_the_job_writes_exactly_what_the_replay_of_its_batches_says(spark: Any, topic: str, tmp_path: Path) -> None:

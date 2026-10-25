@@ -12,7 +12,7 @@ window the job has written: those whose end is at or before the last batch's wat
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -76,11 +76,16 @@ class Replay:
 
 
 def replay(
-    records: Iterable[Record], batches: Sequence[Batch], topic: str, delay_ms: int = WATERMARK_DELAY_MS
+    records: Iterable[Record],
+    batches: Sequence[Batch],
+    topic: str,
+    delay_ms: int = WATERMARK_DELAY_MS,
+    unobserved: Collection[int] = (),
 ) -> Replay:
     """Assign each record to the batch that read it, and keep it or drop it as the stream did. Each batch's watermark
     is also recomputed from the records before it with `delay_ms`, so a job run with another delay is caught (the
-    drop rule alone takes the watermark from the checkpoint, whatever it was)."""
+    drop rule alone takes the watermark from the checkpoint, whatever it was). The records of `unobserved` batches
+    (re-runs the file sink skipped without executing them: restarts.py) don't move the recomputed watermark."""
     by_partition: dict[int, list[Record]] = {}
     for record in sorted(records, key=lambda r: (r.partition, r.offset)):
         by_partition.setdefault(record.partition, []).append(record)
@@ -108,7 +113,8 @@ def replay(
                     invalid += 1
                 else:
                     (dropped if event.event_time <= late_watermark else kept).append(event)
-                    latest_event = event.event_time if latest_event is None else max(latest_event, event.event_time)
+                    if batch.batch_id not in unobserved:
+                        latest_event = event.event_time if latest_event is None else max(latest_event, event.event_time)
                 i += 1
             position[partition] = i
         late_watermark = batch.watermark_ms
@@ -139,6 +145,14 @@ class Report:
     # The published backfill's rows and the truth of every valid record the raw query read (very late ones too);
     # None when the run has no backfill.
     backfill: tuple[list[Row], list[Row]] | None = None
+    # The DuckDB sink's rows and the rows the replay of its own query's batches expects; None when it wasn't used.
+    duckdb: tuple[list[Row], list[Row]] | None = None
+    # Batches the DuckDB query's checkpoint gives a watermark the records before them don't (should be none).
+    duckdb_watermark_errors: list[str] = field(default_factory=list)
+    restarts: int = 0  # recorded starts of the job (restarts.py)
+    # minute_aggregates batches a restart ran again after the file sink had logged them: skipped, not executed, so
+    # their records didn't move the watermark (the replay leaves them out of it).
+    skipped_reruns: list[int] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -148,7 +162,20 @@ class Report:
             and self.raw_events[0] == self.raw_events[1]
             and self.dead_letters[0] == self.dead_letters[1]
             and (self.backfill is None or self.backfill[0] == self.backfill[1])
+            and (self.duckdb is None or self.duckdb[0] == self.duckdb[1])
+            and not self.duckdb_watermark_errors
         )
+
+    def _duckdb_line(self) -> str:
+        if self.duckdb is None:
+            return "duckdb sink: not used"
+        rows, expected = self.duckdb
+        verdict = (
+            "equal"
+            if rows == expected
+            else f"{len(set(expected) - set(rows))} missing, {len(set(rows) - set(expected))} unexpected"
+        )
+        return f"duckdb sink: {len(rows)} rows written, {len(expected)} expected: {verdict}"
 
     def _backfill_line(self) -> str:
         if self.backfill is None:
@@ -176,6 +203,10 @@ class Report:
             *(f"  {problem}" for problem in r.watermark_errors[:10]),
             f"raw_events: {self.raw_events[0]} written, {self.raw_events[1]} valid records read",
             f"dead_letters: {self.dead_letters[0]} written, {self.dead_letters[1]} invalid records read",
+            f"restarts: {self.restarts} recorded; batches re-run after the sink logged them (their records didn't move "
+            f"the watermark): {', '.join(map(str, self.skipped_reruns)) or 'none'}",
+            self._duckdb_line(),
+            *(f"  duckdb watermark: {problem}" for problem in self.duckdb_watermark_errors[:10]),
             self._backfill_line(),
             "orphan files (not in any sink log, never read): "
             + (", ".join(f"{name} {n}" for name, n in self.orphans.items()) or "none"),
@@ -188,6 +219,7 @@ def check_run(bootstrap: str, topic: str, root: Path, timeout_s: float = 60.0) -
     its own query's checkpoint, since the three queries read Kafka independently."""
     from flowcast.kafka_io import read_topic
     from flowcast.layout import Paths, current_backfill
+    from flowcast.restarts import read_starts, skipped_reruns
     from flowcast.views import connect, latest_batch, orphan_files
 
     paths = Paths(root)
@@ -207,10 +239,28 @@ def check_run(bootstrap: str, topic: str, root: Path, timeout_s: float = 60.0) -
             raise CheckpointError(f"{name}: the sink and its checkpoint disagree on the last batch; stop the job first")
         per_query[name] = batches
         orphans[name] = len(orphan_files(sink))
+    duckdb_rows: list[Row] | None = None
+    if paths.checkpoint("duckdb_aggregates").is_dir():
+        from flowcast.duckdb_sink import read
+
+        batches = committed_batches(paths.checkpoint("duckdb_aggregates"))
+        if not batches:
+            raise CheckpointError(f"{paths.checkpoint('duckdb_aggregates')}: no committed batches")
+        duckdb_rows, last = read(paths.duckdb)
+        # The sink commits a batch's transaction just before the checkpoint commits the batch, as a file sink logs it.
+        if last != batches[-1].batch_id:
+            raise CheckpointError(
+                "duckdb_aggregates: the sink and its checkpoint disagree on the last batch; stop the job first"
+            )
+        per_query["duckdb_aggregates"] = batches
     records = read_topic(bootstrap, topic, timeout_s)
-    result = replay(records, per_query["minute_aggregates"], topic)
+    starts = read_starts(paths)
+    skipped = skipped_reruns(starts, "minute_aggregates")
+    result = replay(records, per_query["minute_aggregates"], topic, unobserved=skipped)
     raw_read = replay(records, per_query["raw_events"], topic)
     dead_read = replay(records, per_query["dead_letters"], topic)
+    # The DuckDB query's foreachBatch runs every batch, re-runs included, so its records all move its watermark.
+    duckdb_replay = replay(records, per_query["duckdb_aggregates"], topic) if duckdb_rows is not None else None
     con = connect(root)
     try:
         rows = con.execute("SELECT window_start, event_type, events, revenue_cents FROM minute_aggregates").fetchall()
@@ -231,6 +281,10 @@ def check_run(bootstrap: str, topic: str, root: Path, timeout_s: float = 60.0) -
         raw_events=(int(raw_count[0]), len(raw_read.kept) + len(raw_read.dropped)),
         dead_letters=(int(dead_count[0]), dead_read.invalid),
         orphans=orphans,
+        duckdb=None if duckdb_rows is None or duckdb_replay is None else (duckdb_rows, expected_rows(duckdb_replay)),
+        duckdb_watermark_errors=[] if duckdb_replay is None else duckdb_replay.watermark_errors,
+        restarts=len(starts),
+        skipped_reruns=sorted(skipped),
         backfill=None
         if current_backfill(paths) is None
         else (
