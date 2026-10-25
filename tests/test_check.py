@@ -16,6 +16,7 @@ from flowcast.check import (
     read_progress,
     replay,
 )
+from flowcast.duckdb_sink import DuckDBSink
 from flowcast.kafka_io import Record
 from flowcast.schema import Event, encode
 from flowcast.truth import Row
@@ -410,3 +411,43 @@ def test_a_report_without_the_dedupe_operator_is_refused() -> None:
     report["stateOperators"] = report["stateOperators"][:1]  # type: ignore[index]
     with pytest.raises(CheckpointError, match="expected one dedupeWithinWatermark operator, found 0"):
         late_accounting({0: report}, replay(ACCOUNTED, ACCOUNTED_BATCHES, TOPIC), ACCOUNTED_BATCHES)
+
+
+def fake_duckdb(root: Path, rows: list[Row], w1: int = T0 - 180_000, sink_batches: int = 2) -> None:
+    """The DuckDB query's checkpoint (the aggregate query's two batches) and its sink, written by the real sink."""
+    checkpoint = root / "_checkpoints" / "duckdb_aggregates"
+    write_batch(checkpoint, 0, 0, [kafka_offsets(p0=1)])
+    write_batch(checkpoint, 1, w1, [kafka_offsets(p0=3)])
+    (checkpoint / "metadata").write_text(json.dumps({"id": "b6df5fb3-e11e-4f3b-b554-1b1ba4de55cb"}))
+    sink = DuckDBSink(root / "aggregates.duckdb", checkpoint)
+    for batch_id in range(sink_batches):
+        sink.write(batch_id, rows if batch_id == 1 else [])
+
+
+@pytest.mark.usefixtures("stub_kafka")
+def test_check_run_holds_the_duckdb_sink_to_its_own_querys_replay(tmp_path: Path) -> None:
+    expected = [Row(T0 - 300_000, "page_view", 1, 0)]
+    fake_run(tmp_path, expected, 4, 1)
+    fake_duckdb(tmp_path, expected)
+    report = check_run("unused", TOPIC, tmp_path)
+    assert report.duckdb == (expected, expected) and report.ok
+    assert "duckdb sink: 1 rows written, 1 expected: equal" in report.lines()
+
+
+@pytest.mark.usefixtures("stub_kafka")
+def test_check_run_fails_a_duckdb_query_whose_watermark_isnt_its_records(tmp_path: Path) -> None:
+    # foreachBatch executes every batch, re-runs included, so there's no skipped batch to excuse a difference.
+    expected = [Row(T0 - 300_000, "page_view", 1, 0)]
+    fake_run(tmp_path, expected, 4, 1)
+    fake_duckdb(tmp_path, expected, w1=T0 - 240_000)
+    report = check_run("unused", TOPIC, tmp_path)
+    assert report.duckdb == (expected, expected) and not report.ok
+    assert f"  duckdb watermark: batch 1: watermark {T0 - 240_000}, expected {T0 - 180_000}" in report.lines()
+
+
+@pytest.mark.usefixtures("stub_kafka")
+def test_check_run_refuses_a_duckdb_sink_a_batch_ahead_of_its_checkpoint(tmp_path: Path) -> None:
+    fake_run(tmp_path, [Row(T0 - 300_000, "page_view", 1, 0)], 4, 1)
+    fake_duckdb(tmp_path, [Row(T0 - 300_000, "page_view", 1, 0)], sink_batches=3)
+    with pytest.raises(CheckpointError, match="duckdb_aggregates: the sink and its checkpoint disagree"):
+        check_run("unused", TOPIC, tmp_path)

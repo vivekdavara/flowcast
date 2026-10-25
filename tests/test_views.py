@@ -170,6 +170,9 @@ def test_orphan_files_are_the_data_files_no_batch_lists(tmp_path: Path) -> None:
     log_file(sink, "0", [(alias / "event_date=2026-01-01" / "part-a.parquet", "add")])
     assert data_files(sink) == [logged, orphan]
     assert orphan_files(sink) == [orphan]
+    # And the other way round: the sink reached through the other spelling, its log naming the real path.
+    log_file(sink, "0", [(logged, "add")])
+    assert orphan_files(alias) == [alias / "event_date=2026-01-01" / "part-b.parquet"]
     assert orphan_files(tmp_path / "missing") == []
 
 
