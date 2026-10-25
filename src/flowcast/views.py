@@ -14,7 +14,7 @@ from urllib.parse import unquote, urlparse
 
 import duckdb
 
-from flowcast.layout import Paths
+from flowcast.layout import Paths, current_backfill
 from flowcast.truth import DUCKDB_COLUMNS
 
 KAFKA_COLUMNS = {"topic": "VARCHAR", "partition": "INTEGER", "offset": "BIGINT", "kafka_timestamp": "TIMESTAMPTZ"}
@@ -29,6 +29,8 @@ COLUMNS = {
     },
     "dead_letters": {**KAFKA_COLUMNS, "value": "BLOB", "error": "VARCHAR"},
 }
+# The batch backfill's result has the stream's aggregate columns.
+COLUMNS["backfill_aggregates"] = COLUMNS["minute_aggregates"]
 
 
 class SinkLogError(Exception):
@@ -122,21 +124,27 @@ def _view_sql(name: str, files: list[Path], *, date_partition: str | None = None
         columns = ", ".join(f"NULL::{kind} AS {column}" for column, kind in COLUMNS[name].items())
         return f"CREATE OR REPLACE VIEW {name} AS SELECT {columns} WHERE false"
     listed = ", ".join("'" + str(f).replace("'", "''") + "'" for f in files)
+    # union_by_name: files written before schema version 2 have no campaign column; matched by name, their rows read
+    # it as null (by position, DuckDB would refuse the mismatch, or worse, pair up columns that merely line up).
     if date_partition is None:
-        return f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM read_parquet([{listed}])"
+        return f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM read_parquet([{listed}], union_by_name = true)"
     date = f"CAST(regexp_extract(filename, '/{date_partition}=([^/]+)/[^/]+$', 1) AS DATE) AS {date_partition}"
-    source = f"read_parquet([{listed}], hive_partitioning = false, filename = true)"
+    source = f"read_parquet([{listed}], hive_partitioning = false, filename = true, union_by_name = true)"
     return f"CREATE OR REPLACE VIEW {name} AS SELECT * EXCLUDE (filename), {date} FROM {source}"
 
 
 def connect(root: Path, database: str = ":memory:") -> duckdb.DuckDBPyConnection:
-    """A DuckDB connection with the three views over the job's outputs under `root` (layout.Paths)."""
+    """A DuckDB connection with the three views over the job's outputs under `root` (layout.Paths), and a fourth,
+    `backfill_aggregates`, over the published backfill (empty if there is none)."""
     paths = Paths(root)
     con = duckdb.connect(database)
     try:
         con.execute(_view_sql("raw_events", committed_files(paths.raw_events), date_partition="event_date"))
         con.execute(_view_sql("minute_aggregates", committed_files(paths.minute_aggregates)))
         con.execute(_view_sql("dead_letters", committed_files(paths.dead_letters)))
+        # A backfill is published whole (its directory named by the CURRENT pointer), so every file in it counts.
+        backfill = current_backfill(paths)
+        con.execute(_view_sql("backfill_aggregates", sorted(backfill.glob("*.parquet")) if backfill else []))
     except BaseException:
         con.close()
         raise

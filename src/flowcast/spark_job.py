@@ -123,14 +123,22 @@ def _revenue() -> Column:
     return F.when(F.col("event_type") == "purchase", F.col("price_cents") * F.col("quantity")).otherwise(F.lit(0))
 
 
+# What makes two records the same event: a re-sent copy has the same event_id.
+DEDUPE_KEY = ["event_id"]
+
+
 def deduplicated(events: DataFrame, delay: str = WATERMARK_DELAY) -> DataFrame:
-    """The events with an `event_ts` timestamp, a watermark `delay` behind the latest event time, and each event_id
-    once. On a stream, a row at or before the previous batch's watermark is dropped here (DESIGN.md "Ground truth")."""
-    return (
-        events.withColumn("event_ts", F.timestamp_millis("event_time"))
-        .withWatermark("event_ts", delay)
-        .dropDuplicatesWithinWatermark(["event_id"])
-    )
+    """The events with an `event_ts` timestamp and each event_id once.
+
+    On a stream: with a watermark `delay` behind the latest event time, and a row at or before the previous batch's
+    watermark is dropped here (DESIGN.md "Ground truth"). On a batch (the backfill) there's nothing to wait for, so no
+    watermark and no late rows: every event_id once. Spark 4.2 refuses dropDuplicatesWithinWatermark on a batch
+    DataFrame, so the batch form is dropDuplicates over the same key.
+    """
+    stamped = events.withColumn("event_ts", F.timestamp_millis("event_time"))
+    if not events.isStreaming:
+        return stamped.dropDuplicates(DEDUPE_KEY)
+    return stamped.withWatermark("event_ts", delay).dropDuplicatesWithinWatermark(DEDUPE_KEY)
 
 
 def window_counts(events: DataFrame) -> DataFrame:

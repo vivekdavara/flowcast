@@ -171,3 +171,30 @@ def test_orphan_files_are_the_data_files_no_batch_lists(tmp_path: Path) -> None:
     assert data_files(sink) == [logged, orphan]
     assert orphan_files(sink) == [orphan]
     assert orphan_files(tmp_path / "missing") == []
+
+
+def test_raw_files_from_before_and_after_schema_version_2_read_as_one_view(tmp_path: Path) -> None:
+    # A job upgraded in place: its first batches wrote files with no campaign column, later ones with it.
+    day = tmp_path / "raw_events" / "event_date=2026-01-01"
+    day.mkdir(parents=True)
+    old, new = day / "part-0.parquet", day / "part-1.parquet"
+    v1_columns = ", ".join(
+        f"{'0' if kind in ('INTEGER', 'BIGINT') else 'NULL'}::{kind} AS {column}"
+        for column, kind in COLUMNS["raw_events"].items()
+        if column not in ("campaign", "event_date")
+    )
+    with duckdb.connect() as con:
+        con.execute(f"COPY (SELECT {v1_columns}) TO '{old}'")
+        # Columns in another order, as a reader can't assume they line up.
+        con.execute(f"COPY (SELECT 'newsletter' AS campaign, {v1_columns}) TO '{new}'")
+    log_file(tmp_path / "raw_events", "0", [(old, "add")])
+    log_file(tmp_path / "raw_events", "1", [(new, "add")])
+    con = connect(tmp_path)
+    try:
+        rows = con.execute("SELECT campaign, event_date FROM raw_events ORDER BY campaign NULLS FIRST").fetchall()
+        assert [(campaign, str(date)) for campaign, date in rows] == [
+            (None, "2026-01-01"),
+            ("newsletter", "2026-01-01"),
+        ]
+    finally:
+        con.close()

@@ -27,5 +27,30 @@ class Paths:
     def minute_aggregates(self) -> Path:
         return self.root / "minute_aggregates"
 
+    @property
+    def backfill(self) -> Path:
+        """The batch backfill's results: a directory per run and the `CURRENT` pointer to the published one."""
+        return self.root / "backfill"
+
+    @property
+    def duckdb(self) -> Path:
+        """The idempotent DuckDB sink's database (written only when the job runs with it)."""
+        return self.root / "aggregates.duckdb"
+
     def checkpoint(self, output: str) -> Path:
         return self.root / "_checkpoints" / output
+
+
+class LayoutError(Exception):
+    pass
+
+
+def current_backfill(paths: Paths) -> Path | None:
+    """The published backfill's directory (named by `backfill/CURRENT`), or None if there is none."""
+    pointer = paths.backfill / "CURRENT"
+    if not pointer.exists():
+        return None
+    name = pointer.read_text().strip()
+    if not name or "/" in name or name.startswith("."):
+        raise LayoutError(f"{pointer}: not a backfill directory name: {name!r}")
+    return paths.backfill / name

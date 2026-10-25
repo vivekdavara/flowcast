@@ -293,3 +293,37 @@ def test_check_run_counts_orphan_files_without_failing(tmp_path: Path) -> None:
         report.lines()
     )
     assert report.ok
+
+
+def publish_backfill(root: Path, rows: list[Row]) -> None:
+    select = " UNION ALL ".join(
+        f"SELECT {r.window_start}::BIGINT AS window_start, '{r.event_type}' AS event_type,"
+        f" {r.events}::BIGINT AS events, {r.revenue_cents}::BIGINT AS revenue_cents"
+        for r in rows
+    )
+    copy_to(root / "backfill" / "run-1" / "part-0.parquet", select)
+    (root / "backfill" / "CURRENT").write_text("run-1\n")
+
+
+@pytest.mark.usefixtures("stub_kafka")
+def test_check_run_holds_a_published_backfill_to_the_truth_of_every_raw_record(tmp_path: Path) -> None:
+    fake_run(tmp_path, [Row(T0 - 300_000, "page_view", 1, 0)], 4, 1)
+    report = check_run("unused", TOPIC, tmp_path)
+    assert report.backfill is None and "backfill: none published" in report.lines()
+
+    # The raw query read p0:0-3, the four valid records: the truth of all four, the record past the watermark too.
+    truth = [
+        Row(T0 - 300_000, "page_view", 1, 0),
+        Row(T0 - 180_000, "page_view", 1, 0),
+        Row(T0, "page_view", 1, 0),
+        Row(T0, "purchase", 1, 200),
+    ]
+    publish_backfill(tmp_path, truth)
+    report = check_run("unused", TOPIC, tmp_path)
+    assert report.backfill == (truth, truth)
+    assert "backfill: 4 rows, 4 in the truth of every raw record: equal" in report.lines() and report.ok
+
+    publish_backfill(tmp_path, truth[:3])  # a backfill missing a row (one taken before the last records came in)
+    report = check_run("unused", TOPIC, tmp_path)
+    assert "backfill: 3 rows, 4 in the truth of every raw record: 1 missing, 0 unexpected" in report.lines()
+    assert not report.ok

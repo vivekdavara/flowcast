@@ -136,6 +136,9 @@ class Report:
     # Per output, data files no committed batch lists: left by batches that failed and were run again. The views
     # never read them, so they don't make a run wrong; they're reported because a glob of the directory would.
     orphans: dict[str, int] = field(default_factory=dict)
+    # The published backfill's rows and the truth of every valid record the raw query read (very late ones too);
+    # None when the run has no backfill.
+    backfill: tuple[list[Row], list[Row]] | None = None
 
     @property
     def ok(self) -> bool:
@@ -144,7 +147,19 @@ class Report:
             and not self.replay.watermark_errors
             and self.raw_events[0] == self.raw_events[1]
             and self.dead_letters[0] == self.dead_letters[1]
+            and (self.backfill is None or self.backfill[0] == self.backfill[1])
         )
+
+    def _backfill_line(self) -> str:
+        if self.backfill is None:
+            return "backfill: none published"
+        rows, truth = self.backfill
+        verdict = (
+            "equal"
+            if rows == truth
+            else f"{len(set(truth) - set(rows))} missing, {len(set(rows) - set(truth))} unexpected"
+        )
+        return f"backfill: {len(rows)} rows, {len(truth)} in the truth of every raw record: {verdict}"
 
     def lines(self) -> list[str]:
         r = self.replay
@@ -161,6 +176,7 @@ class Report:
             *(f"  {problem}" for problem in r.watermark_errors[:10]),
             f"raw_events: {self.raw_events[0]} written, {self.raw_events[1]} valid records read",
             f"dead_letters: {self.dead_letters[0]} written, {self.dead_letters[1]} invalid records read",
+            self._backfill_line(),
             "orphan files (not in any sink log, never read): "
             + (", ".join(f"{name} {n}" for name, n in self.orphans.items()) or "none"),
             "ok" if self.ok else "MISMATCH",
@@ -171,7 +187,7 @@ def check_run(bootstrap: str, topic: str, root: Path, timeout_s: float = 60.0) -
     """Check a stopped run of the job under `root` against the records in `topic`. Each output is checked against
     its own query's checkpoint, since the three queries read Kafka independently."""
     from flowcast.kafka_io import read_topic
-    from flowcast.layout import Paths
+    from flowcast.layout import Paths, current_backfill
     from flowcast.views import connect, latest_batch, orphan_files
 
     paths = Paths(root)
@@ -200,6 +216,9 @@ def check_run(bootstrap: str, topic: str, root: Path, timeout_s: float = 60.0) -
         rows = con.execute("SELECT window_start, event_type, events, revenue_cents FROM minute_aggregates").fetchall()
         raw_count = con.execute("SELECT count(*) FROM raw_events").fetchone()
         dead_count = con.execute("SELECT count(*) FROM dead_letters").fetchone()
+        backfill_rows = con.execute(
+            "SELECT window_start, event_type, events, revenue_cents FROM backfill_aggregates"
+        ).fetchall()
     finally:
         con.close()
     assert raw_count is not None and dead_count is not None
@@ -212,4 +231,10 @@ def check_run(bootstrap: str, topic: str, root: Path, timeout_s: float = 60.0) -
         raw_events=(int(raw_count[0]), len(raw_read.kept) + len(raw_read.dropped)),
         dead_letters=(int(dead_count[0]), dead_read.invalid),
         orphans=orphans,
+        backfill=None
+        if current_backfill(paths) is None
+        else (
+            sorted(Row(int(a), str(b), int(c), int(d)) for a, b, c, d in backfill_rows),
+            minute_aggregates(raw_read.kept + raw_read.dropped),
+        ),
     )

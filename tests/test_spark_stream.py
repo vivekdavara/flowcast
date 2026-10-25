@@ -134,6 +134,15 @@ def test_the_cli_runs_the_job_checks_it_and_queries_it(topic: str, tmp_path: Pat
     assert check.returncode == 0, check.stdout + check.stderr
     assert check.stdout.splitlines()[-1] == "ok"
     assert f"raw_events: {len(events)} written, {len(events)} valid records read" in check.stdout
+    # The backfill: published, then held to the truth of every raw record by the same check.
+    backfill = subprocess.run([*cli, "backfill", "--out", str(out)], capture_output=True, text=True, timeout=300)
+    assert backfill.returncode == 0, backfill.stderr[-8000:]
+    assert f"backfill: {len(minute_aggregates(events))} rows, {len(set(e.event_id for e in events))} events" in (
+        backfill.stdout
+    )
+    check = subprocess.run([*cli, "check", *kafka, "--out", str(out)], capture_output=True, text=True, timeout=120)
+    assert check.returncode == 0, check.stdout + check.stderr
+    assert "in the truth of every raw record: equal" in check.stdout
     query = [*cli, "query", "--out", str(out), "SELECT count(*) AS n, sum(events) > 0 AS any FROM raw_events, ("]
     assert subprocess.run(query, capture_output=True, text=True).returncode == 1  # bad SQL: exit 1
     query[-1] = "SELECT count(*) AS n FROM raw_events"

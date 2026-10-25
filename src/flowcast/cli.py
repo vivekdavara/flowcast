@@ -33,6 +33,7 @@ from flowcast.kafka_io import (
     topic_counts,
     wait_for_broker,
 )
+from flowcast.layout import LayoutError
 from flowcast.pacing import Pacer
 from flowcast.schema import Event, InvalidEvent, decode, encode
 from flowcast.truth import duckdb_minute_aggregates, minute_aggregates
@@ -133,6 +134,11 @@ def build_parser() -> argparse.ArgumentParser:
     check = sub.add_parser("check", help="check a stopped run's outputs exactly against the records in the topic")
     _kafka_options(check)
     check.add_argument("--out", type=Path, default=DEFAULT_OUT, help="the run's directory (default %(default)s)")
+
+    backfill = sub.add_parser(
+        "backfill", help="recompute a run's minute aggregates from all its raw events, as a batch, and publish them"
+    )
+    backfill.add_argument("--out", type=Path, default=DEFAULT_OUT, help="the run's directory (default %(default)s)")
 
     query = sub.add_parser("query", help="run SQL over a run's DuckDB views and print CSV")
     query.add_argument("sql", help="e.g. 'SELECT * FROM minute_aggregates ORDER BY window_start LIMIT 10'")
@@ -265,6 +271,39 @@ def _check(args: argparse.Namespace) -> None:
         raise StreamFailed("the outputs don't match the replay of the job's batches")
 
 
+def _backfill(args: argparse.Namespace) -> None:
+    # Imported here, as for stream: Spark takes seconds to start and needs Java.
+    from flowcast.backfill import BackfillError, run
+    from flowcast.layout import Paths
+    from flowcast.spark_job import session
+
+    spark = session("flowcast-backfill", kafka=False)
+    spark.sparkContext.setLogLevel("WARN")
+    try:
+        written = run(spark, Paths(args.out))
+    except BackfillError as exc:
+        raise StreamFailed(str(exc)) from exc
+    finally:
+        spark.stop()
+    con = connect(args.out)
+    try:
+        rows = con.execute("SELECT count(*), coalesce(sum(events), 0) FROM backfill_aggregates").fetchone()
+        # Where the stream wrote a window, it can only have fewer events: the late records it dropped.
+        fewer = con.execute(
+            "SELECT count(*), coalesce(sum(b.events - s.events), 0) FROM minute_aggregates s "
+            "JOIN backfill_aggregates b USING (window_start, event_type) WHERE b.events <> s.events"
+        ).fetchone()
+        streamed = con.execute("SELECT count(*) FROM minute_aggregates").fetchone()
+    finally:
+        con.close()
+    assert rows is not None and fewer is not None and streamed is not None
+    print(f"backfill: {rows[0]} rows, {rows[1]} events, published as {written}")
+    print(
+        f"of the {streamed[0]} rows the stream wrote, {fewer[0]} have fewer events than the backfill "
+        f"({fewer[1]} events in all: late records the stream dropped)"
+    )
+
+
 def _query(args: argparse.Namespace) -> None:
     try:
         con = connect(args.out)
@@ -300,6 +339,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "stream": _stream,
         "check": _check,
         "query": _query,
+        "backfill": _backfill,
     }
     if args.command == "version":
         print(f"flowcast {__version__}")
@@ -314,7 +354,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     except UsageError as exc:
         print(f"flowcast {args.command}: {exc}", file=sys.stderr)
         return 2
-    except (KafkaError, InvalidEvent, OSError, StreamFailed, CheckpointError, SinkLogError, duckdb.Error) as exc:
+    except (
+        KafkaError,
+        InvalidEvent,
+        OSError,
+        StreamFailed,
+        CheckpointError,
+        SinkLogError,
+        LayoutError,
+        duckdb.Error,
+    ) as exc:
         print(f"flowcast {args.command}: {exc}", file=sys.stderr)
         return 1
     return 0
