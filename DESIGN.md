@@ -255,7 +255,9 @@ second run harmless:
   its queries, `start` appends each query's state (planned, logged, committed) to `<run>/_restarts.jsonl`; a file-sink
   batch that was logged but not committed at a start is a skipped re-run, and the replay leaves its records out of the
   watermark. A `foreachBatch` sink is always called and collects its frame, so the DuckDB query's watermark always
-  matches its records, and is checked without exceptions.
+  matches its records, and is checked without exceptions. The hand-made crash states hadn't shown this because an
+  available-now run ends with a batch that reads nothing; `test_a_rerun_the_file_sink_skips_doesnt_move_the_watermark`
+  removes that batch and cuts off the one before it, and reproduces the lag every time.
 
 ## The batch backfill (day 3)
 

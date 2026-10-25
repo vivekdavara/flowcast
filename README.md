@@ -225,6 +225,9 @@ Day 3:
   sink's included; restarted with new records; every output must reconcile exactly, the re-run batch must keep the
   offsets it planned, nothing may be counted twice (a glob of the directory would), and Spark's late and duplicate
   counts must equal the replay's.
+- `tests/test_recovery.py`'s third test makes the kill test's finding deterministic: the run's trailing no-data batch
+  taken away and the data batch before it cut off after its sink logged it; on restart the next batch keeps the
+  skipped batch's watermark, and the check passes with the start log and fails without it.
 - `tests/test_kill.py` (Kafka and Spark): three SIGKILLs of the running job at random moments, restarts, the check
   exact; the query states it records.
 - `tests/test_restarts.py`: the restart log (a torn line from a killed start skipped), and which re-runs the file sink
@@ -306,7 +309,9 @@ It also said that its `pkill -f` had killed a process of my test run (see `b5b6b
 No review agent today: the other portfolio track's session was running on the same machine for the whole window, and
 two sessions plus an agent hit the account's usage limit once before (October 14). The day's own kill test did a
 reviewer's job: it found the skipped re-run's watermark (above), which the hand-made crash states in `test_recovery.py`
-hadn't shown (I didn't establish why; their cut-off batch is the last of an available-now run). The first run of the DuckDB sink's tests found that DuckDB's
+hadn't shown: an available-now run ends with a batch that reads nothing (in the kill run, batch 41 had batch 40's end
+offsets and 0 input rows), so cutting off the last batch loses no event times. A third test now takes that batch away
+and cuts off the one before it, which reproduces the lag every time. The first run of the DuckDB sink's tests found that DuckDB's
 `executemany` refuses an empty list, which most batches of a stream are; mutating the views' `union_by_name` away
 fails the schema test.
 

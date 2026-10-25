@@ -17,6 +17,7 @@ from flowcast.check import CheckpointError, check_run, committed_batches
 from flowcast.generator import Config, sessions
 from flowcast.kafka_io import delete_topic, ensure_topic, produce, wait_for_broker
 from flowcast.layout import Paths
+from flowcast.restarts import restarts_file
 from flowcast.views import committed_files, connect, orphan_files
 from tests.test_spark_stream import BAD, produce_raw, run
 
@@ -140,3 +141,54 @@ def test_a_batch_cut_off_before_its_commit_runs_again_exactly_once(
             globbed = con.execute(f"SELECT count(*) FROM read_parquet('{paths.raw_events}/**/*.parquet')").fetchone()
         assert globbed is not None and globbed[0] > len(events)
         assert set(orphans).isdisjoint(committed_files(paths.raw_events))
+
+
+def unplan(paths: Paths, name: str, batch_id: int) -> None:
+    """Take a batch away as if the crash came before Spark planned it: its offset, commit and sink log entries, and
+    the state store versions it wrote (version = batch id + 1, in every operator's every partition)."""
+    checkpoint = paths.checkpoint(name)
+    unwrite(checkpoint / "offsets" / str(batch_id))
+    unwrite(checkpoint / "commits" / str(batch_id))
+    unwrite(log_entry(sink_of(paths, name), batch_id))
+    version = batch_id + 1
+    for path in (checkpoint / "state").glob(f"*/*/{version}.*"):
+        unwrite(path)
+
+
+@pytest.mark.parametrize("told", [True, False], ids=["with-the-start-log", "without-it"])
+def test_a_rerun_the_file_sink_skips_doesnt_move_the_watermark(
+    spark: Any, topic: str, tmp_path: Path, told: bool
+) -> None:
+    # What the kill test found one run in three, made deterministic.
+    events = [r.event for r in sessions(200, CONFIG)]
+    half = len(events) // 2
+    produce(BOOTSTRAP, topic, events[:half])
+    run(spark, topic, tmp_path)
+    paths = Paths(tmp_path)
+    checkpoint = paths.checkpoint("minute_aggregates")
+    *_, data_batch, no_data_batch = committed_batches(checkpoint)
+    # An available-now run ends with a batch that reads nothing and only moves the watermark, so cutting off the last
+    # batch (as the test above does) loses no event times. Take that one away, as if the crash came before it was
+    # planned, and cut off the batch before it, which read records, after its sink logged it.
+    assert no_data_batch.sources == data_batch.sources
+    unplan(paths, "minute_aggregates", no_data_batch.batch_id)
+    unwrite(checkpoint / "commits" / str(data_batch.batch_id))
+
+    produce(BOOTSTRAP, topic, events[half:])
+    run(spark, topic, tmp_path)  # re-runs data_batch (the sink skips it), then reads the second half
+    if not told:
+        restarts_file(paths).unlink()  # a run directory from before the start log existed
+
+    report = check_run(BOOTSTRAP, topic, tmp_path)
+    after = next(b for b in committed_batches(checkpoint) if b.batch_id == data_batch.batch_id + 1)
+    # The batch after the skipped one kept its watermark: its records never reached the watermark tracker.
+    assert after.watermark_ms == data_batch.watermark_ms
+    assert report.written == report.expected  # the rows are right either way
+    if told:
+        assert report.skipped_reruns == [data_batch.batch_id]
+        assert report.replay.watermark_errors == [] and report.ok, "\n".join(report.lines())
+    else:
+        assert report.replay.watermark_errors[0].startswith(
+            f"batch {after.batch_id}: watermark {data_batch.watermark_ms}, expected "
+        )
+        assert not report.ok
