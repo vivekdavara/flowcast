@@ -4,7 +4,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from flowcast.views import COLUMNS, SinkLogError, committed_files, connect, latest_batch
+from flowcast.views import COLUMNS, SinkLogError, committed_files, connect, data_files, latest_batch, orphan_files
 
 
 def log_file(sink: Path, name: str, entries: list[tuple[Path | str, str]], version: str = "v1") -> None:
@@ -150,3 +150,24 @@ def test_a_quote_in_a_path_is_escaped_in_the_view(tmp_path: Path) -> None:
         assert con.execute("SELECT event_type FROM minute_aggregates").fetchall() == [("checkout",)]
     finally:
         con.close()
+
+
+def test_orphan_files_are_the_data_files_no_batch_lists(tmp_path: Path) -> None:
+    sink = tmp_path / "sink"
+    logged = sink / "event_date=2026-01-01" / "part-a.parquet"
+    orphan = sink / "event_date=2026-01-01" / "part-b.parquet"
+    hidden = [
+        sink / ".part-c.parquet.crc",
+        sink / "_temporary" / "part-d.parquet",
+        sink / "_temporary" / "0" / "part-e.parquet",
+    ]
+    for path in [logged, orphan, *hidden]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"")
+    # The log names the file through another spelling of the same directory (on macOS, /var is /private/var).
+    alias = tmp_path / "alias"
+    alias.symlink_to(sink)
+    log_file(sink, "0", [(alias / "event_date=2026-01-01" / "part-a.parquet", "add")])
+    assert data_files(sink) == [logged, orphan]
+    assert orphan_files(sink) == [orphan]
+    assert orphan_files(tmp_path / "missing") == []

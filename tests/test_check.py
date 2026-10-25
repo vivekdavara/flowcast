@@ -280,3 +280,16 @@ def test_check_run_fails_a_job_run_with_another_watermark_delay(tmp_path: Path) 
     assert report.written == report.expected
     assert not report.ok
     assert f"  batch 1: watermark {T0 - 240_000}, expected {T0 - 180_000}" in report.lines()
+
+
+@pytest.mark.usefixtures("stub_kafka")
+def test_check_run_counts_orphan_files_without_failing(tmp_path: Path) -> None:
+    # A raw-events file of a batch that failed before it was logged: never read, so the run still reconciles.
+    fake_run(tmp_path, [Row(T0 - 300_000, "page_view", 1, 0)], 4, 1)
+    copy_to(tmp_path / "raw_events" / "event_date=2026-01-01" / "part-1.parquet", "SELECT 1 AS n")
+    report = check_run("unused", TOPIC, tmp_path)
+    assert report.orphans == {"minute_aggregates": 0, "raw_events": 1, "dead_letters": 0}
+    assert "orphan files (not in any sink log, never read): minute_aggregates 0, raw_events 1, dead_letters 0" in (
+        report.lines()
+    )
+    assert report.ok

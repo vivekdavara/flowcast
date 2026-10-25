@@ -95,6 +95,25 @@ def committed_files(sink: Path) -> list[Path]:
     return sorted(live)
 
 
+def data_files(sink: Path) -> list[Path]:
+    """Every Parquet file under a sink's directory, committed or not (the log and hidden files aside), sorted."""
+    if not sink.is_dir():
+        return []
+    return sorted(
+        path
+        for path in sink.rglob("*.parquet")
+        if not any(part.startswith(("_", ".")) for part in path.relative_to(sink).parts)
+    )
+
+
+def orphan_files(sink: Path) -> list[Path]:
+    """The sink's data files that no committed batch lists: what a batch wrote before it failed (a crash, a kill)
+    and never logged. The retried batch writes new files under new names, so these stay; the views never read them,
+    and a reader that globbed the directory would count their rows twice."""
+    committed = {path.resolve() for path in committed_files(sink)}
+    return [path for path in data_files(sink) if path.resolve() not in committed]
+
+
 def _view_sql(name: str, files: list[Path], *, date_partition: str | None = None) -> str:
     """The view over `files`. Spark keeps a partition column (`date_partition`) only in the directory name, so it is
     read from each file's own parent directory: DuckDB's hive_partitioning would take every key=value segment of

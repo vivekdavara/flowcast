@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -133,6 +133,9 @@ class Report:
     written: list[Row]
     raw_events: tuple[int, int]  # (written, valid records the raw query's batches read)
     dead_letters: tuple[int, int]  # (written, invalid records the dead-letter query's batches read)
+    # Per output, data files no committed batch lists: left by batches that failed and were run again. The views
+    # never read them, so they don't make a run wrong; they're reported because a glob of the directory would.
+    orphans: dict[str, int] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -158,6 +161,8 @@ class Report:
             *(f"  {problem}" for problem in r.watermark_errors[:10]),
             f"raw_events: {self.raw_events[0]} written, {self.raw_events[1]} valid records read",
             f"dead_letters: {self.dead_letters[0]} written, {self.dead_letters[1]} invalid records read",
+            "orphan files (not in any sink log, never read): "
+            + (", ".join(f"{name} {n}" for name, n in self.orphans.items()) or "none"),
             "ok" if self.ok else "MISMATCH",
         ]
 
@@ -167,10 +172,11 @@ def check_run(bootstrap: str, topic: str, root: Path, timeout_s: float = 60.0) -
     its own query's checkpoint, since the three queries read Kafka independently."""
     from flowcast.kafka_io import read_topic
     from flowcast.layout import Paths
-    from flowcast.views import connect, latest_batch
+    from flowcast.views import connect, latest_batch, orphan_files
 
     paths = Paths(root)
     per_query: dict[str, list[Batch]] = {}
+    orphans: dict[str, int] = {}
     for name, sink in (
         ("minute_aggregates", paths.minute_aggregates),
         ("raw_events", paths.raw_events),
@@ -184,6 +190,7 @@ def check_run(bootstrap: str, topic: str, root: Path, timeout_s: float = 60.0) -
         if latest_batch(sink) != batches[-1].batch_id:
             raise CheckpointError(f"{name}: the sink and its checkpoint disagree on the last batch; stop the job first")
         per_query[name] = batches
+        orphans[name] = len(orphan_files(sink))
     records = read_topic(bootstrap, topic, timeout_s)
     result = replay(records, per_query["minute_aggregates"], topic)
     raw_read = replay(records, per_query["raw_events"], topic)
@@ -204,4 +211,5 @@ def check_run(bootstrap: str, topic: str, root: Path, timeout_s: float = 60.0) -
         written=sorted(Row(int(a), str(b), int(c), int(d)) for a, b, c, d in rows),
         raw_events=(int(raw_count[0]), len(raw_read.kept) + len(raw_read.dropped)),
         dead_letters=(int(dead_count[0]), dead_read.invalid),
+        orphans=orphans,
     )
