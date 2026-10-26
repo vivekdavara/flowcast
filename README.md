@@ -416,7 +416,7 @@ fails the schema test.
 
 One review agent read the day's code at `018bd39` (with the pacer and benchmark commits copied in) with a correctness
 brief, in its own worktree, with no Spark and no broker so it wouldn't disturb the latency runs; it ran 38 minutes, much
-of it with the Mac asleep. It reproduced 5 bugs, each now a test in `tests/review_d4/` and fixed in `fde8879`: a window
+of it with the Mac asleep. It reproduced 5 bugs; 4 are now tests in `tests/review_d4/`, fixed in `fde8879`: a window
 row with a NULL key broke no rule; values the rules exist to report (a price of 2^62, an event time of 10^16)
 overflowed DuckDB and crashed them; a torn sink-log line made `quality` exit 2 and `latency` print a traceback; and the
 nearest-rank percentile ranked in floats (p99.9 of 1..1000 was 1000). Not fixed yet: the rules don't restate the
