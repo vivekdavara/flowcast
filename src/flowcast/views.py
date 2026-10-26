@@ -37,7 +37,7 @@ class SinkLogError(Exception):
     pass
 
 
-def _log_files(log: Path) -> tuple[dict[int, Path], dict[int, Path]]:
+def log_files(log: Path) -> tuple[dict[int, Path], dict[int, Path]]:
     """The sink log's batch files and compact files, by batch id."""
     batches: dict[int, Path] = {}
     compacts: dict[int, Path] = {}
@@ -57,7 +57,7 @@ def latest_batch(sink: Path) -> int:
     log = sink / "_spark_metadata"
     if not log.is_dir():
         return -1
-    batches, compacts = _log_files(log)
+    batches, compacts = log_files(log)
     return max([*batches, *compacts], default=-1)
 
 
@@ -71,7 +71,7 @@ def committed_files(sink: Path) -> list[Path]:
     log = sink / "_spark_metadata"
     if not log.is_dir():
         return []
-    batches, compacts = _log_files(log)
+    batches, compacts = log_files(log)
     start = max(compacts, default=-1)
     after = sorted(i for i in batches if i > start)
     if after != list(range(start + 1, start + 1 + len(after))):
@@ -79,22 +79,29 @@ def committed_files(sink: Path) -> list[Path]:
     files = ([compacts[start]] if start >= 0 else []) + [batches[i] for i in after]
     live: set[Path] = set()
     for path in files:
-        lines = path.read_text().splitlines()
-        if not lines or lines[0] != "v1":
-            raise SinkLogError(f"{path}: not a version-1 sink log file")
-        for line in lines[1:]:
-            entry = json.loads(line)
-            uri = urlparse(entry["path"])
-            if uri.scheme not in ("", "file"):
-                raise SinkLogError(f"{path}: {entry['path']} isn't a local file")
-            file = Path(unquote(uri.path))
-            if entry["action"] == "add":
+        for action, file in log_entries(path):
+            if action == "add":
                 live.add(file)
-            elif entry["action"] == "delete":
-                live.discard(file)
             else:
-                raise SinkLogError(f"{path}: unknown action {entry['action']!r}")
+                live.discard(file)
     return sorted(live)
+
+
+def log_entries(path: Path) -> list[tuple[str, Path]]:
+    """One sink log file's entries: ("add" or "delete", the data file). The file is `v1` then a JSON entry a line."""
+    lines = path.read_text().splitlines()
+    if not lines or lines[0] != "v1":
+        raise SinkLogError(f"{path}: not a version-1 sink log file")
+    entries = []
+    for line in lines[1:]:
+        entry = json.loads(line)
+        uri = urlparse(entry["path"])
+        if uri.scheme not in ("", "file"):
+            raise SinkLogError(f"{path}: {entry['path']} isn't a local file")
+        if entry["action"] not in ("add", "delete"):
+            raise SinkLogError(f"{path}: unknown action {entry['action']!r}")
+        entries.append((entry["action"], Path(unquote(uri.path))))
+    return entries
 
 
 def data_files(sink: Path) -> list[Path]:

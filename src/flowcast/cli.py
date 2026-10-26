@@ -33,9 +33,11 @@ from flowcast.kafka_io import (
     topic_counts,
     wait_for_broker,
 )
+from flowcast.latency import latencies, throughput
 from flowcast.layout import LayoutError
 from flowcast.pacing import Pacer
 from flowcast.quality import MAX_DEAD_LETTER_RATE, check_quality
+from flowcast.restarts import DUCKDB_QUERY, FILE_SINK_QUERIES
 from flowcast.schema import Event, InvalidEvent, decode, encode
 from flowcast.truth import duckdb_minute_aggregates, minute_aggregates
 from flowcast.views import SinkLogError, connect
@@ -143,6 +145,11 @@ def build_parser() -> argparse.ArgumentParser:
         "backfill", help="recompute a run's minute aggregates from all its raw events, as a batch, and publish them"
     )
     backfill.add_argument("--out", type=Path, default=DEFAULT_OUT, help="the run's directory (default %(default)s)")
+
+    latency = sub.add_parser(
+        "latency", help="a stopped run's latencies (produced, event time, window end to queryable) and throughput"
+    )
+    latency.add_argument("--out", type=Path, default=DEFAULT_OUT, help="the run's directory (default %(default)s)")
 
     quality = sub.add_parser("quality", help="check a run's outputs against the data-quality rules (no Kafka needed)")
     quality.add_argument("--out", type=Path, default=DEFAULT_OUT, help="the run's directory (default %(default)s)")
@@ -292,6 +299,15 @@ def _check(args: argparse.Namespace) -> None:
         raise StreamFailed("the outputs don't match the replay of the job's batches")
 
 
+def _latency(args: argparse.Namespace) -> None:
+    print("\n".join(latencies(args.out).lines()))
+    print("throughput:")
+    for query in (*FILE_SINK_QUERIES, DUCKDB_QUERY):
+        rate = throughput(args.out, query)
+        if rate is not None:
+            print(f"  {rate.line()}")
+
+
 def _quality(args: argparse.Namespace) -> None:
     try:
         report = check_quality(args.out, args.max_dead_letter_rate)
@@ -372,6 +388,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "check": _check,
         "query": _query,
         "quality": _quality,
+        "latency": _latency,
         "backfill": _backfill,
     }
     if args.command == "version":
