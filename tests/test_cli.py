@@ -114,14 +114,14 @@ def test_no_broker_is_a_failure_after_the_wait(capsys: pytest.CaptureFixture[str
 BOOTSTRAP = os.environ.get("FLOWCAST_TEST_BOOTSTRAP", "")
 
 
-@pytest.mark.kafka
-@pytest.mark.skipif(not BOOTSTRAP, reason="FLOWCAST_TEST_BOOTSTRAP not set (scripts/kafka.sh start)")
 def acknowledged(line: str) -> dict[int, int]:
     """The partition counts of produce's "acknowledged by partition: 0: n, 1: m" line."""
     pairs = (part.split(": ") for part in line.removeprefix("acknowledged by partition: ").split(", "))
     return {int(p): int(n) for p, n in pairs}
 
 
+@pytest.mark.kafka
+@pytest.mark.skipif(not BOOTSTRAP, reason="FLOWCAST_TEST_BOOTSTRAP not set (scripts/kafka.sh start)")
 def test_topic_produce_and_count(capsys: pytest.CaptureFixture[str]) -> None:
     topic = f"test-{uuid.uuid4()}"
     kafka = ["--bootstrap", BOOTSTRAP, "--topic", topic]
