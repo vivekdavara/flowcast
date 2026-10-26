@@ -303,3 +303,44 @@ didn't carry over: Spark 4.2 refuses `dropDuplicatesWithinWatermark` on a batch,
 on the same key when its input isn't a stream. The result must equal the truth of every event, very late ones included,
 and `flowcast check` holds it to that. It's published by writing a new directory and renaming a pointer file over
 `CURRENT`, so a reader sees a whole result or the previous one.
+
+## Measuring, batch size and data quality (day 4)
+
+**How do you know when a row became queryable?**
+From the file sink's own log. Spark writes a batch's Parquet files first and lists them in `_spark_metadata/<batch>`
+when the batch commits; the DuckDB views read that log, never a glob, so a row is visible exactly from the moment its
+batch's log file exists. That file's modification time is the commit time (`latency.commits`). Each row is then
+measured against its batch: from its Kafka timestamp (the producer's CreateTime: the pipeline's own latency), from its
+event time (what a user waits), and for a minute window from the window's end. Spark's progress reports would give a
+batch's start and duration, but not when a reader could see it.
+
+**Why are your event-time latencies only from the live benchmark?**
+Because the generator's clock starts at 2026-01-01 by default: on a backlog run, "event time to queryable" would be
+ten months. `--start-ms now` anchors the first session at the wall clock and `--speed 1` sends each record at its
+arrival time, so an event's time is when it was sent less its simulated network delay and lateness. `--speed 10` would
+be ten times the rate but would also squeeze event time, so the live rate is set with `--sessions-per-second` instead.
+
+**Why did 300-record batches drop 10.7% of a backlog as late, and 2,000-record batches almost nothing?**
+Not because those records were late: regenerating day 3's stream to label every record, 1,200 of the 1,280 dropped were
+on time (median lateness 128 ms). `maxOffsetsPerTrigger` splits a batch across partitions in proportion to what each
+has left, so the partitions stay level in record counts, not in event time, while the watermark is one number for the
+whole topic. In a sparse stream (0.5 sessions a second that day), a partition holding fewer active sessions covers
+more event time per record, and its lead over the slowest partition reached 388 s at the median batch end, more than
+the 180 s delay. A batch drops by the previous batch's watermark, which trails what it reads by the delay plus about a
+batch's step. At 300 a batch the step is 138 s, so the lead passes on-time records of the slow partitions; at 2,000 the
+step is 1,011 s and covers the lead. `batching.py` reproduces Spark's split (`rateLimit`) and the replay: on day 3's
+topic it gives the same end offsets as the real checkpoint for all 41 batches and the same 1,280 dropped event ids.
+
+**So how would you fix it?**
+In this job, by reading a backlog in large batches, or by a watermark delay larger than the partitions' lead.
+Generally the lead is the thing to bound: Spark has one watermark per query and no per-partition watermarks for
+Kafka (Flink has them, with idle-partition handling), so a live stream that is balanced in time is fine, and a
+backfill of a sparse topic through the streaming path is where it bites. The batch backfill (day 3) has no watermark
+at all, which is why it is the source of truth for history.
+
+**Why data-quality rules when `check` already proves the run exact?**
+`check` needs the broker, the checkpoints and a stopped job; it answers "did the job do what it should". The rules
+answer "is this data sane" from the Parquet files alone, so they run on a copy, on a run in progress, or after
+something other than the job touched the files. Each is SQL that counts the rows breaking it (an unknown event type,
+a window off the minute, a Kafka record that's both an event and a dead letter, a window counting more than the raw
+events behind it), so a failure names its rows.
