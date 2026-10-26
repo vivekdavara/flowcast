@@ -13,6 +13,15 @@ def _java_available() -> bool:
     return bool(home and os.path.exists(os.path.join(home, "bin", "java"))) or shutil.which("java") is not None
 
 
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Every test that uses Spark is marked `spark`, whether or not it says so, so `-m spark` and `-m "not spark"`
+    split the suite exactly: CI runs the two halves as separate jobs. A test uses Spark through the `spark` fixture, or
+    by starting the job in a subprocess, which its own `spark` mark has to say."""
+    for item in items:
+        if "spark" in getattr(item, "fixturenames", ()):
+            item.add_marker(pytest.mark.spark)
+
+
 @pytest.fixture(scope="session")
 def spark() -> Iterator[object]:
     if not _java_available():
