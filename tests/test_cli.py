@@ -239,3 +239,23 @@ def test_stream_needs_a_positive_batch_cap(capsys: pytest.CaptureFixture[str]) -
 def test_bad_producer_settings_are_usage_errors(args: list[str], capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["produce", "--sessions", "1", "--bootstrap", "127.0.0.1:1", "--wait", "0", *args]) == 2
     assert "flowcast produce:" in capsys.readouterr().err
+
+
+def test_produce_paces_against_the_wall_clock_from_start_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With --start-ms now, produce's pacer is anchored at that moment; with a fixed start it isn't."""
+    import flowcast.cli as cli
+
+    made: list[int | None] = []
+
+    class Spy(cli.Pacer):
+        def __init__(self, records: object, speed: float, **kwargs: int | None) -> None:
+            made.append(kwargs.get("anchor_ms"))
+            raise ValueError("stop here")  # before any broker is needed
+
+    monkeypatch.setattr(cli, "Pacer", Spy)
+    before = time.time() * 1000
+    assert main(["produce", "--records", "1", "--speed", "1", "--start-ms", "now"]) == 2
+    assert main(["produce", "--records", "1", "--speed", "1", "--start-ms", "1800000000000"]) == 2
+    anchor = made[0]
+    assert anchor is not None and before - 1 <= anchor <= time.time() * 1000
+    assert made[1] is None

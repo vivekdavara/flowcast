@@ -63,3 +63,22 @@ def test_nothing_in_is_nothing_out() -> None:
 def test_speed_must_be_positive_and_finite(speed: float) -> None:
     with pytest.raises(ValueError, match="speed"):
         Pacer([], speed)
+
+
+def test_an_anchor_sends_records_at_their_own_times_on_the_wall_clock() -> None:
+    clock = FakeClock()  # monotonic 100.0 is wall-clock epoch 1,000.0 s
+    wall = lambda: clock.now + 900.0  # noqa: E731
+    # The stream starts at epoch 1,000,000 ms; its first record arrives 300 ms after that, the second 1 s after.
+    pacer = Pacer(at(1_000_300, 1_001_000), 1.0, clock, clock.sleep, anchor_ms=1_000_000, wall=wall)
+    sent_at = [wall() for _ in pacer]
+    assert sent_at == pytest.approx([1_000.3, 1_001.0])  # each at its arrival time, the first one included
+
+
+def test_a_late_start_against_the_anchor_is_lag_not_a_shift() -> None:
+    clock = FakeClock()
+    wall = lambda: clock.now + 900.0 + 3.0  # noqa: E731  # the producer starts 3 s after the anchor
+    pacer = Pacer(at(1_000_300, 1_001_000, 1_005_000), 1.0, clock, clock.sleep, anchor_ms=1_000_000, wall=wall)
+    sent_at = [wall() for _ in pacer]
+    # The first two are overdue and go at once; the third still goes at its own time, not 3 s late.
+    assert sent_at == pytest.approx([1_003.0, 1_003.0, 1_005.0])
+    assert pacer.max_lag_s == pytest.approx(2.7)

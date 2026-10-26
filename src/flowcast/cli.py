@@ -86,6 +86,25 @@ def _start_ms(text: str) -> int:
         raise argparse.ArgumentTypeError(f"not epoch milliseconds or 'now': {text!r}") from None
 
 
+class _StartMs(argparse.Action):
+    """--start-ms, remembering whether it was "now" (`start_now`): `produce --speed` then paces against the wall clock
+    from that moment, so a late start can't shift the event times."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | Sequence[object] | None,
+        option_string: str | None = None,
+    ) -> None:
+        text = str(values)
+        try:
+            namespace.start_ms = _start_ms(text)
+        except argparse.ArgumentTypeError as exc:
+            parser.error(f"argument --start-ms: {exc}")
+        namespace.start_now = text == "now"
+
+
 def _stream_options(parser: argparse.ArgumentParser, *, from_file: bool = False) -> None:
     size = parser.add_mutually_exclusive_group(required=True)
     size.add_argument("--sessions", type=_positive, help="every record of this many whole sessions")
@@ -93,9 +112,10 @@ def _stream_options(parser: argparse.ArgumentParser, *, from_file: bool = False)
     if from_file:
         size.add_argument("--input", type=Path, help="a file of JSON lines instead (each line checked)")
     parser.add_argument("--seed", type=int, default=Config.seed, help="generator seed (default %(default)s)")
+    parser.set_defaults(start_now=False)
     parser.add_argument(
         "--start-ms",
-        type=_start_ms,
+        action=_StartMs,
         default=Config.start_ms,
         help="when the first session starts, epoch ms, or 'now' for the wall clock (default 2026-01-01T00:00:00Z)",
     )
@@ -258,7 +278,8 @@ def _topic(args: argparse.Namespace) -> None:
 def _produce(args: argparse.Namespace) -> None:
     try:
         settings = ProducerSettings(args.linger_ms, args.batch_bytes, args.compression)
-        pacer = None if args.speed is None else Pacer(_records(args), args.speed)
+        anchor = args.start_ms if args.start_now else None
+        pacer = None if args.speed is None else Pacer(_records(args), args.speed, anchor_ms=anchor)
     except ValueError as exc:
         raise UsageError(str(exc)) from exc
     events: Iterable[Event] = pacer if pacer is not None else (record.event for record in _records(args))

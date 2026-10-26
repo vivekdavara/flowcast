@@ -20,7 +20,13 @@ MIN_SLEEP_S = 0.001
 
 class Pacer:
     """Yields each record's event no earlier than its arrival time (relative to the first record's), divided by
-    `speed`. If the consumer falls behind, records go out at once and `max_lag_s` says by how much it fell behind."""
+    `speed`. If the consumer falls behind, records go out at once and `max_lag_s` says by how much it fell behind.
+
+    With `anchor_ms` (epoch milliseconds), arrival times are relative to that moment on the wall clock instead of to
+    the first record: at speed 1, a stream generated from `start_ms = anchor_ms` is sent at its own arrival times, so
+    its event times are real. Starting late then shows as lag rather than shifting every event time (day 4: the
+    producer's start had moved them by about 3 s against the records' Kafka timestamps).
+    """
 
     def __init__(
         self,
@@ -28,6 +34,9 @@ class Pacer:
         speed: float,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        *,
+        anchor_ms: int | None = None,
+        wall: Callable[[], float] = time.time,
     ) -> None:
         if not math.isfinite(speed) or speed <= 0:
             raise ValueError("speed must be a positive, finite number")
@@ -35,6 +44,8 @@ class Pacer:
         self._speed = speed
         self._clock = clock
         self._sleep = sleep
+        self._anchor_ms = anchor_ms
+        self._wall = wall
         self.max_lag_s = 0.0
         self.slept_s = 0.0
 
@@ -42,7 +53,12 @@ class Pacer:
         start_wall = start_arrival = None
         for record in self._records:
             if start_wall is None or start_arrival is None:
-                start_wall, start_arrival = self._clock(), record.arrival_ms
+                if self._anchor_ms is None:
+                    start_wall, start_arrival = self._clock(), record.arrival_ms
+                else:
+                    # The clock reading that the anchor's moment on the wall clock corresponds to (maybe in the past).
+                    start_wall = self._clock() - (self._wall() * 1000 - self._anchor_ms) / 1000
+                    start_arrival = self._anchor_ms
             due = start_wall + (record.arrival_ms - start_arrival) / 1000 / self._speed
             wait = due - self._clock()
             if wait >= MIN_SLEEP_S:
