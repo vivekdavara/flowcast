@@ -15,7 +15,7 @@ result can be checked against it.
 | 1 | Design, event schema, generator, ground truth, local Kafka, round trip, CI | done |
 | 2 | Producer at volume; the Spark job (validate, dead letters, raw events, windowed aggregates); DuckDB views; the exact check | done |
 | 3 | Exactly-once across killed and restarted jobs (file sinks, an idempotent DuckDB sink, SIGKILL tests); late-data accounting against Spark's metrics; schema version 2; batch backfill | done |
-| 4 | Benchmarks (throughput, end-to-end latency, trigger intervals); data-quality checks | |
+| 4 | Latency and throughput from the sink logs; benchmarks over batch sizes and trigger intervals; why small batches drop on-time records (a model of Spark's split, checked against the job); data-quality rules | done |
 | 5 | Static HTML report, results, walkthrough, v1.0.0 | |
 
 [DESIGN.md](DESIGN.md) is the specification for all five days; [WALKTHROUGH.md](WALKTHROUGH.md) has the questions an
@@ -123,6 +123,19 @@ with SIGKILL at random moments, restarts it each time, and checks the result.
 paces records by their arrival times (real time; 10 is ten times faster), and `--linger-ms`, `--batch-bytes` and
 `--compression` set the producer's batching.
 
+Measure a run and check its data (day 4):
+
+```bash
+.venv/bin/flowcast latency --out data/demo
+.venv/bin/flowcast quality --out data/demo
+.venv/bin/python scripts/bench.py sizes --topic kill-d3 --sizes 300,2000,10000
+.venv/bin/python scripts/bench.py triggers --topic live --seconds 300 --sessions-per-second 100 --triggers 1,5,10
+```
+
+`latency` prints produced, event time and window end to queryable (p50, p95, p99, max) and each query's throughput;
+event time is only meaningful for a run fed by `produce --speed 1 --start-ms now`. `quality` exits 1 when a rule
+fails. `bench.py` writes its runs and `results.json` under `data/bench`.
+
 `generate --sessions N` writes every record of N whole sessions (very late ones included); `--records N` is the first
 N records of the endless stream, which is what a collector would have received by then. Both take `--seed`, the
 disorder settings (`--late-fraction`, `--very-late-fraction`, `--duplicate-fraction`) and `--schema-version`.
@@ -183,6 +196,43 @@ battery charging from 40%) while another Claude Code session (the other portfoli
 The tests' runs (`test_recovery.py`, `test_kill.py`, `test_backfill.py`, `test_spark_stream.py`) check the same things on
 smaller streams on every `make check` and in CI; the backfill there equals the truth of every event exactly.
 
+## Results (day 4)
+
+Synthetic data. Apple M3, macOS 26.6.2, Python 3.11.12, PySpark 4.2.0 on Java 21.0.12, Kafka 4.3.1 (one local broker,
+6 partitions). Power: on AC with the lid closed, the Mac in a dark wake (no sleep during any run: `pmset -g log`'s last
+sleep ended at 15:29:55, before the first); load average 26 to 30 while a job ran (Spark's `local[*]` and its Python
+workers), about 4.5 between runs. No other portfolio session was running.
+
+**Batch size over a backlog.** Day 3's kill-run topic (`kill-d3`: 11,969 records, 3,000 sessions at 0.5 a second of
+event time, 3 invalid) read from nothing by `flowcast stream --available-now --max-offsets SIZE`, a fresh process and
+run directory per size; "dropped" is the exact replay of the job's own batches (`check` passed on every run), and
+"predicted" is `batching.simulate` from the records alone, without Spark:
+
+| Records a batch | Batches | Wall time (JVM start included) | Records/s over the wall time | Dropped as late | Predicted |
+|---|---|---|---|---|---|
+| 300 | 41 | 101.0 s | 119 | **1,280 (10.69%)** | 1,280 |
+| 2,000 | 6 | 68.4 s | 175 | 5 (0.04%) | 5 |
+| 10,000 | 2 | 27.8 s | 430 | 0 | 0 |
+
+`.venv/bin/python scripts/bench.py --out data/bench sizes --topic kill-d3 --sizes 300,2000,10000` at `2a4cece`
+(results in `data/bench/results.json`). A topic this small measures per-batch overhead, not Spark's throughput: four
+queries each read and parse every batch, and each batch writes Parquet files and commits four logs.
+
+**Why small batches drop on-time records** (the question day 3 left open). Regenerating that stream to label every
+record, 1,200 of the 1,280 dropped were on time (median lateness 128 ms; `.scratch/late_analysis.py`, not committed).
+`maxOffsetsPerTrigger` splits a batch across partitions by what each has left, which levels record counts, not event
+times, and the watermark is global. In a sparse stream a partition's records can cover far more event time than
+another's: at the median batch end the leading partition was 388 s ahead of the slowest at 300 a batch, 423 s at 2,000
+(`batching.skew`). A batch drops by the previous batch's watermark, which trails what it reads by the 180 s delay plus
+about a batch's step: 138 s at 300 a batch, 1,011 s at 2,000. At 300 the lead passes the slow partitions' on-time
+records; at 2,000 the step covers it. `batching.plan` reproduces Spark's split exactly: on that topic all 41 batches'
+end offsets equal the real checkpoint's, and the predicted drops are the same 1,280 event ids
+(`tests/test_spark_batching.py` holds a fresh job to the same on every run).
+
+**Data quality.** `flowcast quality --out data/kill-d3`: all 16 rules and the dead-letter ceiling pass on day 3's kill
+run (11,966 raw events, 494 windows, 3 dead letters: 0.0251% of records), and on each of the three batch-size runs
+above (`flowcast quality --out data/bench/kill-d3-size-300`, and so on).
+
 ## Tests
 
 - `tests/test_schema.py`: every rule of the field table refuses a bad value with its reason; JSON edge cases
@@ -241,9 +291,28 @@ Day 3:
   watermark (and only that batch's), the late-data accounting (per-batch counts, partial coverage, each difference
   failing). `tests/test_schema.py`, `test_generator.py`, `test_spark_parse.py` and `test_views.py` cover version 2.
 
-CI (`.github/workflows/ci.yml`): lint, types and every test (Spark on Temurin 21, its jars cached) against an
-`apache/kafka:4.3.1` service container; and
-`scripts/kafka.sh` against the Apache tarball (SHA-256 checked) on Java 21.
+Day 4:
+
+- `tests/test_quality.py`: a clean run and an empty one pass; each of 20 broken rows fails exactly the rules it should
+  (a window no raw event backs also fails the cross-check); a record twice, or both an event and a dead letter; a
+  window twice; windows counting more events or revenue than raw (fewer is allowed); the dead-letter ceiling; the
+  Parquet path through the views; the command's exit codes.
+- `tests/test_latency.py`: nearest-rank percentiles; each batch's own files and commit time, through a compact file;
+  a cleaned-up log refused; the three latencies from commit times set by hand; throughput from progress reports, empty
+  batches left out; the command.
+- `tests/test_batching.py`: Spark's split (shares of what's left, floored, ceil below 1, never past the end); a plan
+  reads everything; on a backlog where one partition is sparse, small batches drop the dense partition's on-time
+  records and larger ones fewer; the watermarks the model gives; the lead and the step.
+- `tests/test_spark_batching.py` (Kafka and Spark): the real job's batches and drops equal the model's on a stream with
+  nothing late.
+- `tests/test_cli.py`: `--start-ms` (and `now`) and `--sessions-per-second`, their errors; its Kafka test now skips
+  without a broker (its marks were on a helper).
+
+CI (`.github/workflows/ci.yml`): lint and types, and every test in two halves on separate runners (`-m spark` and
+`-m "not spark"`; conftest marks every test that takes the `spark` fixture), Spark on Temurin 21 with its jars cached,
+against an `apache/kafka:4.3.1` service container; and `scripts/kafka.sh` against the Apache tarball (SHA-256 checked)
+on Java 21. With the split, the Spark half took 6m26s and the rest 3m01s (run 40387756949), against 8m29s for the
+one job on day 3.
 
 ## Review of day 1
 
