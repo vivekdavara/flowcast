@@ -35,6 +35,7 @@ from flowcast.kafka_io import (
 )
 from flowcast.layout import LayoutError
 from flowcast.pacing import Pacer
+from flowcast.quality import MAX_DEAD_LETTER_RATE, check_quality
 from flowcast.schema import Event, InvalidEvent, decode, encode
 from flowcast.truth import duckdb_minute_aggregates, minute_aggregates
 from flowcast.views import SinkLogError, connect
@@ -142,6 +143,15 @@ def build_parser() -> argparse.ArgumentParser:
         "backfill", help="recompute a run's minute aggregates from all its raw events, as a batch, and publish them"
     )
     backfill.add_argument("--out", type=Path, default=DEFAULT_OUT, help="the run's directory (default %(default)s)")
+
+    quality = sub.add_parser("quality", help="check a run's outputs against the data-quality rules (no Kafka needed)")
+    quality.add_argument("--out", type=Path, default=DEFAULT_OUT, help="the run's directory (default %(default)s)")
+    quality.add_argument(
+        "--max-dead-letter-rate",
+        type=float,
+        default=MAX_DEAD_LETTER_RATE,
+        help="the largest share of records that may be dead letters (default %(default)s)",
+    )
 
     query = sub.add_parser("query", help="run SQL over a run's DuckDB views and print CSV")
     query.add_argument("sql", help="e.g. 'SELECT * FROM minute_aggregates ORDER BY window_start LIMIT 10'")
@@ -282,6 +292,17 @@ def _check(args: argparse.Namespace) -> None:
         raise StreamFailed("the outputs don't match the replay of the job's batches")
 
 
+def _quality(args: argparse.Namespace) -> None:
+    try:
+        report = check_quality(args.out, args.max_dead_letter_rate)
+    except ValueError as exc:
+        raise UsageError(str(exc)) from exc
+    print("\n".join(report.lines()))
+    if not report.ok:
+        broken = sum(not r.ok for r in report.results) + (report.dead_letter_rate > report.max_dead_letter_rate)
+        raise StreamFailed(f"the outputs break {broken} data-quality rule{'' if broken == 1 else 's'}")
+
+
 def _backfill(args: argparse.Namespace) -> None:
     # Imported here, as for stream: Spark takes seconds to start and needs Java.
     from flowcast.backfill import BackfillError, run
@@ -350,6 +371,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "stream": _stream,
         "check": _check,
         "query": _query,
+        "quality": _quality,
         "backfill": _backfill,
     }
     if args.command == "version":
