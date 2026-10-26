@@ -93,14 +93,18 @@ def log_entries(path: Path) -> list[tuple[str, Path]]:
     if not lines or lines[0] != "v1":
         raise SinkLogError(f"{path}: not a version-1 sink log file")
     entries = []
-    for line in lines[1:]:
-        entry = json.loads(line)
-        uri = urlparse(entry["path"])
+    for number, line in enumerate(lines[1:], start=2):
+        try:
+            entry = json.loads(line)
+            uri = urlparse(entry["path"])
+            action = entry["action"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            raise SinkLogError(f"{path}: line {number} isn't a sink log entry") from None
         if uri.scheme not in ("", "file"):
             raise SinkLogError(f"{path}: {entry['path']} isn't a local file")
-        if entry["action"] not in ("add", "delete"):
-            raise SinkLogError(f"{path}: unknown action {entry['action']!r}")
-        entries.append((entry["action"], Path(unquote(uri.path))))
+        if action not in ("add", "delete"):
+            raise SinkLogError(f"{path}: unknown action {action!r}")
+        entries.append((action, Path(unquote(uri.path))))
     return entries
 
 

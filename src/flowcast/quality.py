@@ -98,9 +98,13 @@ ROW_RULES = (
     Rule(
         "event date is the event time's UTC date",
         "raw_events",
-        "event_date <> CAST(make_timestamp(event_time * 1000) AS DATE)",
+        # Only for times in range (the rule above reports the rest): event_time * 1000 can overflow (day-4 review).
+        f"CASE WHEN event_time >= {MIN_EVENT_TIME} AND event_time < {MAX_EVENT_TIME} "
+        "THEN event_date <> CAST(make_timestamp(event_time * 1000) AS DATE) END",
         _RECORD,
     ),
+    # A NULL key would pass every other window rule (a comparison with NULL is NULL, so the row isn't counted).
+    Rule("required fields set", "minute_aggregates", "window_start IS NULL OR event_type IS NULL", _WINDOW),
     Rule("known event type", "minute_aggregates", f"event_type NOT IN {_in(EVENT_TYPES)}", _WINDOW),
     Rule("window starts on a minute", "minute_aggregates", "window_start % 60000 <> 0", _WINDOW),
     Rule(
@@ -136,8 +140,9 @@ SET_RULES = (
         "no window counts more than the raw events",
         "minute_aggregates vs raw_events",
         """WITH events AS (
-               SELECT event_id, any_value(event_time // 60000 * 60000) AS window_start, any_value(event_type) AS
-                      event_type, max(CASE WHEN event_type = 'purchase' THEN price_cents * quantity ELSE 0 END) AS rev
+               SELECT event_id, any_value(event_time // 60000 * 60000) AS window_start,
+                      any_value(event_type) AS event_type,
+                      max(CASE WHEN event_type = 'purchase' THEN price_cents::HUGEINT * quantity ELSE 0 END) AS rev
                FROM raw_events GROUP BY event_id),
            raw AS (SELECT window_start, event_type, count(*) AS events, sum(rev) AS revenue_cents
                    FROM events GROUP BY ALL)

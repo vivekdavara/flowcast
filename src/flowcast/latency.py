@@ -22,6 +22,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from fractions import Fraction
 from pathlib import Path
 
 import duckdb
@@ -38,7 +39,8 @@ def percentile(sorted_values: Sequence[float], p: float) -> float:
         raise ValueError("no values")
     if not 0 < p <= 100:
         raise ValueError("p must be in (0, 100]")
-    rank = math.ceil(p / 100 * len(sorted_values))
+    # In exact arithmetic: in floats, 99.9 / 100 * 1000 is 999.0000000000001, and the rank would be 1000 (day-4 review).
+    rank = math.ceil(Fraction(str(p)) * len(sorted_values) / 100)
     return sorted_values[rank - 1]
 
 
@@ -186,7 +188,12 @@ def throughput(root: Path, query: str) -> Throughput | None:
     path = Paths(root).progress(query)
     if not path.exists():
         return None
-    reports = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    reports = []
+    for line in path.read_text().splitlines():
+        try:
+            reports.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # a line torn by a killed run, or blank
     reports = [r for r in reports if r["numInputRows"] > 0]
     if not reports:
         return None

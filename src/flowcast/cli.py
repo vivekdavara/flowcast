@@ -356,10 +356,10 @@ def _latency(args: argparse.Namespace) -> None:
 
 
 def _quality(args: argparse.Namespace) -> None:
-    try:
-        report = check_quality(args.out, args.max_dead_letter_rate)
-    except ValueError as exc:
-        raise UsageError(str(exc)) from exc
+    # Checked here, not by catching ValueError from the rules: a torn JSON line is one too (day-4 review).
+    if not 0 <= args.max_dead_letter_rate <= 1:
+        raise UsageError("--max-dead-letter-rate must be between 0 and 1")
+    report = check_quality(args.out, args.max_dead_letter_rate)
     print("\n".join(report.lines()))
     if not report.ok:
         broken = sum(not r.ok for r in report.results) + (report.dead_letter_rate > report.max_dead_letter_rate)
