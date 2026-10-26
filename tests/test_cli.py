@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -54,6 +55,42 @@ def test_generate_passes_the_disorder_settings_on(tmp_path: Path) -> None:
     assert out.read_bytes() == b"".join(encode(r.event) + b"\n" for r in take(2000, config))
     events = [decode(line) for line in out.read_bytes().splitlines()]
     assert len({e.event_id for e in events}) == 2000  # no duplicates
+
+
+def test_generate_starts_when_and_as_fast_as_asked(tmp_path: Path) -> None:
+    out = tmp_path / "events.jsonl"
+    args = ["--start-ms", "1800000000000", "--sessions-per-second", "200"]
+    assert main(["generate", "--records", "500", "--out", str(out), *args]) == 0
+    config = Config(start_ms=1_800_000_000_000, sessions_per_second=200)
+    assert out.read_bytes() == b"".join(encode(r.event) + b"\n" for r in take(500, config))
+
+
+def test_start_now_is_the_wall_clock(tmp_path: Path) -> None:
+    out = tmp_path / "events.jsonl"
+    before = time.time() * 1000
+    assert main(["generate", "--records", "1", "--late-fraction", "0", "--start-ms", "now", "--out", str(out)]) == 0
+    first = decode(out.read_bytes().splitlines()[0])
+    assert before - 1 <= first.event_time <= time.time() * 1000  # the first session's first event is at its start
+
+
+@pytest.mark.parametrize(
+    ("args", "error"),
+    [
+        (["--start-ms", "soon"], "not epoch milliseconds or 'now'"),
+        (["--sessions-per-second", "fast"], "invalid float value"),
+    ],
+)
+def test_bad_start_or_rate_are_usage_errors(args: list[str], error: str, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["generate", "--records", "1", *args])
+    assert exc.value.code == 2 and error in capsys.readouterr().err
+
+
+def test_start_and_rate_out_of_range_are_usage_errors(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["generate", "--records", "1", "--start-ms", "0"]) == 2
+    assert "start_ms must be between" in capsys.readouterr().err
+    assert main(["generate", "--records", "1", "--sessions-per-second", "0"]) == 2
+    assert "sessions_per_second must be in" in capsys.readouterr().err
 
 
 def test_truth_is_the_same_from_either_engine_and_from_a_file(

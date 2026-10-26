@@ -10,6 +10,7 @@ import csv
 import math
 import os
 import sys
+import time
 from collections.abc import Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from itertools import islice
@@ -74,6 +75,17 @@ def _seconds(text: str) -> float:
     return value
 
 
+def _start_ms(text: str) -> int:
+    """Epoch milliseconds, or "now". With `produce --speed 1 --start-ms now` each event's time is about when it is
+    sent (less its network delay and any lateness), so event time to queryable is a real latency (day 4)."""
+    if text == "now":
+        return time.time_ns() // 1_000_000
+    try:
+        return int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not epoch milliseconds or 'now': {text!r}") from None
+
+
 def _stream_options(parser: argparse.ArgumentParser, *, from_file: bool = False) -> None:
     size = parser.add_mutually_exclusive_group(required=True)
     size.add_argument("--sessions", type=_positive, help="every record of this many whole sessions")
@@ -81,6 +93,18 @@ def _stream_options(parser: argparse.ArgumentParser, *, from_file: bool = False)
     if from_file:
         size.add_argument("--input", type=Path, help="a file of JSON lines instead (each line checked)")
     parser.add_argument("--seed", type=int, default=Config.seed, help="generator seed (default %(default)s)")
+    parser.add_argument(
+        "--start-ms",
+        type=_start_ms,
+        default=Config.start_ms,
+        help="when the first session starts, epoch ms, or 'now' for the wall clock (default 2026-01-01T00:00:00Z)",
+    )
+    parser.add_argument(
+        "--sessions-per-second",
+        type=float,
+        default=Config.sessions_per_second,
+        help="sessions started per second of event time (default %(default)s)",
+    )
     parser.add_argument("--duplicate-fraction", type=float, default=Config.duplicate_fraction)
     parser.add_argument("--late-fraction", type=float, default=Config.late_fraction)
     parser.add_argument("--very-late-fraction", type=float, default=Config.very_late_fraction)
@@ -170,6 +194,8 @@ def _config(args: argparse.Namespace) -> Config:
     try:
         return Config(
             seed=args.seed,
+            start_ms=args.start_ms,
+            sessions_per_second=args.sessions_per_second,
             duplicate_fraction=args.duplicate_fraction,
             late_fraction=args.late_fraction,
             very_late_fraction=args.very_late_fraction,
