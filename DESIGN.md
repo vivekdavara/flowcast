@@ -293,12 +293,49 @@ faster with the same bytes.
 
 ## Measurement (day 4)
 
-- Producer throughput (events/s, by batch size and compression), the Spark job's processing rate, end-to-end latency
-  from event time to queryable (per window: when its row is readable in DuckDB, minus its end), and how the micro-batch
-  trigger interval moves both.
-- Data-quality checks over the outputs: counts reconcile with Kafka offsets (every record is a raw event or a dead
-  letter), no duplicate `event_id` after dedupe, aggregates equal the truth within the stated bound.
-- Every number with its command, machine, power state and data size; synthetic data labelled synthetic.
+**When a row becomes queryable.** A reader sees a file-sink batch once the batch's entry is in the sink's
+`_spark_metadata` log (DuckDB above), so that log file's modification time is the moment its rows became queryable.
+`latency.commits` gives each batch its commit time and its own data files (a `.compact` file every 10th batch lists
+every live file so far, so its batch's own are the ones not live before it; a log Spark has already cleaned up before a
+compact is refused, since the batch of a file can't be known then). Every row is then measured against its batch:
+
+| Latency | From | Means |
+|---|---|---|
+| produced to queryable | `kafka_timestamp` (the producer's CreateTime) | the pipeline's own: waiting for the trigger, the batch's work, the commit |
+| event time to queryable | `event_time` | what a user of the data waits: adds the event's network delay and lateness |
+| window end to queryable | a minute window's end | at least the 3-minute watermark delay plus the wait for the batch that closes it |
+
+Event time to queryable is only a latency when event times are on the wall clock: `produce --speed 1 --start-ms now`
+starts the generator's first session when the command runs and sends each record at its arrival time.
+`--sessions-per-second` sets the live rate (`--speed` would compress event time with it). Percentiles are nearest-rank
+(the smallest value with at least p% of the rows at or below it), over every row, not over batches.
+
+**Throughput** comes from Spark's progress reports (saved when a run ends): per query, the rows of the batches that read
+something, over the span from the first such batch's start to the last one's end, and over the batches' own time
+(`triggerExecution`). A backlog run's wall time, JVM start included, is measured around the process.
+
+**The benchmarks** (`scripts/bench.py`): `sizes` reads one backlog topic from nothing at several `--max-offsets`
+(fresh process and run directory each), reporting wall time, events/s, batches and the replay's late drops; `triggers`
+runs a fresh topic and run per trigger interval with the producer at real time for a fixed time, stops the job with
+SIGINT (it saves its progress), and reports the three latencies. Every number goes to `results.json` and the README
+with its command, machine, power state and load.
+
+## Data quality (day 4)
+
+`check` (day 2) holds a stopped run to the exact replay of its Kafka records and needs the broker and the checkpoints.
+`quality.py`'s rules need neither: each is SQL over the DuckDB views that counts the rows breaking it, so they run on a
+copy of the files or during a run. They restate what the decoder and the job promise, so a failure means a bug
+upstream or files something else changed:
+
+- Raw events, row by row: required fields set; known event type, device and schema version, `campaign` only in
+  version 2; event time in range; product fields present exactly for product events and quantity exactly for
+  quantity events; price and quantity in range; `event_date` is the event time's UTC date.
+- Windows, row by row: a known event type; starting on a minute; positive counts; revenue only from purchases.
+- Dead letters: a reason and the record's coordinates; at most 1% of records (`--max-dead-letter-rate`).
+- Across rows: each Kafka record once, as a raw event or a dead letter; each window and event type once; no window
+  counting more events or revenue than the deduplicated raw events of its minute (the stream drops late records, so
+  fewer is allowed). That last one is only conclusive on a stopped run: during one, `raw_events` can trail
+  `minute_aggregates` by a batch.
 
 ## Testing
 
@@ -315,5 +352,5 @@ faster with the same bytes.
 | 1 | This design; the event schema and its strict decoder; the generator with disorder, duplicates and determinism; the ground truth and its DuckDB twin; `scripts/kafka.sh`; topic creation, an idempotent producer and the snapshot reader; CI with a Kafka service container. |
 | 2 | A producer at volume (batching, pacing by arrival time, delivery accounting); the Spark job: parse and validate, dead letters, raw events, windowed aggregates with a watermark, Parquet; DuckDB views; Spark output checked against the truth. |
 | 3 | Exactly-once across a killed and restarted job (checkpoints, the file sink's log, an idempotent DuckDB sink; crash states and real SIGKILLs; restarts recorded); late-data accounting against Spark's metrics; schema version 2; the batch backfill sharing the transformations. |
-| 4 | Benchmarks (events/s, end-to-end latency, trigger interval comparison); data-quality checks. |
+| 4 | Latency (produced, event time and window end to queryable) and throughput from the sink logs and progress reports; benchmarks over batch sizes and trigger intervals; data-quality rules over the outputs; CI split into Spark and non-Spark jobs. |
 | 5 | A static HTML report; README with results; WALKTHROUGH.md; v1.0.0. |
