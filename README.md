@@ -229,6 +229,33 @@ records; at 2,000 the step covers it. `batching.plan` reproduces Spark's split e
 end offsets equal the real checkpoint's, and the predicted drops are the same 1,280 event ids
 (`tests/test_spark_batching.py` holds a fresh job to the same on every run).
 
+**Latency on a live stream.** A fresh topic and run per trigger interval, the producer at real time (`--speed 1
+--start-ms now`, 100 sessions a second: about 375 records a second), the job stopped with SIGINT after the last
+records' batches. Lid open, on battery (93%), the Mac awake; `slept_s` 0.0 for both cases (wall-clock minus monotonic
+time, which grows by any sleep); load average 5 before, 16.6 after:
+
+| Trigger | Records | Batches (raw_events) | Produced to queryable p50 / p95 / p99 | Event time to queryable p50 / p95 / p99 |
+|---|---|---|---|---|
+| 1 s | 33,623 | 99 | **908 / 1,621 / 3,504 ms** | 1,055 / 2,283 / 13,195 ms |
+| 5 s | 33,623 | 22 | **3,104 / 5,485 / 6,962 ms** | 3,308 / 6,005 / 15,497 ms |
+
+`.venv/bin/python scripts/bench.py --out data/bench triggers --topic short-d4 --seconds 90 --sessions-per-second 100
+--triggers 1,5` at `5f29d67`. The event-time column adds the generator's network delay (5 to 250 ms) and lateness
+(3% of records late by up to 2 minutes, 0.2% very late): its p99 is the late records, not the job. At a 1 s trigger the
+queries are busy all the time (each batch takes about a second), so the 1 s run is near what this laptop's job can turn
+around. Those runs sent for 101 s, too short for the watermark (3 minutes) to close a window. A longer run earlier the
+same day (1 s trigger, 90,708 records over 242 s, the Mac in a dark wake on AC, no sleep during it) gave window end to
+queryable **184.5 s** for all 6 window rows it closed: the 180 s delay plus 4.5 s; its produced to queryable was p50
+1,312 / p95 2,256 ms. Its event-time numbers predate the pacer fix (below) and its run directory was removed, so only
+these lines of its `flowcast latency` output are kept. The 5 s and 10 s cases of that run were hit by sleeps (5 s and
+300 s, `pmset -g log`) and are discarded; a full 1/5/10 s comparison with windows is for day 5.
+
+**A measurement bug found on the way.** In that first run, event time to queryable was 3.15 s above produced to
+queryable at the median at a 5 s trigger, against 0.19 s at 1 s. `--start-ms now` was read when the command parsed its
+arguments, but the pacer started its clock at the first send, after connecting to the broker, so a slow start shifted
+every event time. The pacer now runs against the wall clock from that moment (`c032b5f`); in the runs above the gap is
+147 ms and 204 ms, the generator's network delay.
+
 **Data quality.** `flowcast quality --out data/kill-d3`: all 16 rules and the dead-letter ceiling pass on day 3's kill
 run (11,966 raw events, 494 windows, 3 dead letters: 0.0251% of records), and on each of the three batch-size runs
 above (`flowcast quality --out data/bench/kill-d3-size-300`, and so on).
@@ -385,6 +412,17 @@ and cuts off the one before it, which reproduces the lag every time. The first r
 `executemany` refuses an empty list, which most batches of a stream are; mutating the views' `union_by_name` away
 fails the schema test.
 
+## Review of day 4
+
+One review agent read the day's code at `018bd39` (with the pacer and benchmark commits copied in) with a correctness
+brief, in its own worktree, with no Spark and no broker so it wouldn't disturb the latency runs; it ran 38 minutes, much
+of it with the Mac asleep. It reproduced 5 bugs, each now a test in `tests/review_d4/` and fixed in `fde8879`: a window
+row with a NULL key broke no rule; values the rules exist to report (a price of 2^62, an event time of 10^16)
+overflowed DuckDB and crashed them; a torn sink-log line made `quality` exit 2 and `latency` print a traceback; and the
+nearest-rank percentile ranked in floats (p99.9 of 1..1000 was 1000). Not fixed yet: the rules don't restate the
+decoder's string formats (ids, country, page, category, campaign). Its hypothesis that Spark keeps only 100 progress
+reports doesn't hold here (the session keeps 10,000).
+
 ## Design decisions
 
 - **Integer cents and integer milliseconds**, so Python, DuckDB and Spark compute identical answers, compared with `==`.
@@ -415,6 +453,21 @@ fails the schema test.
 - **The backfill is the stream's own code**, published by renaming a pointer file, so a reader never sees half of it.
 - **Readers before writers**: the decoder reads both versions; a producer upgraded first would send its records to
   dead letters, visibly, not to wrong answers.
+
+## Limitations (day 4)
+
+- "Queryable" is when the sink's log names the batch: a reader still has to look. The views take the file list when
+  they're made, so a dashboard that reconnects every few seconds adds that interval to every number here.
+- The latencies cover the two Parquet sinks. The DuckDB sink's rows are readable when its transaction commits, which
+  isn't timed.
+- The batch model covers available-now runs over a backlog, where the end offsets are fixed when the run starts. With a
+  processing-time trigger on a live topic, each batch's end depends on what had arrived by then, which the model
+  doesn't know; the cause (partitions level in records, a global watermark) is the same.
+- The live benchmark ran at one rate (100 sessions a second), on one laptop, in local mode, with the lid closed in a
+  dark wake on AC; it isn't a saturation test, and four queries share the cores, each reading and parsing Kafka on
+  its own.
+- "No window counts more than the raw events" is only conclusive on a stopped run (during one, `raw_events` can trail
+  `minute_aggregates` by a batch); the other rules hold at any moment.
 
 ## Limitations (day 3)
 
