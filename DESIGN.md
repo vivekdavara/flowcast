@@ -320,6 +320,27 @@ runs a fresh topic and run per trigger interval with the producer at real time f
 SIGINT (it saves its progress), and reports the three latencies. Every number goes to `results.json` and the README
 with its command, machine, power state and load.
 
+## Batch size and late data (day 4)
+
+A backlog read in small batches can drop records that arrived on time. `maxOffsetsPerTrigger` caps a batch's records,
+and Spark's Kafka source splits the cap across partitions in proportion to what each has left
+(`KafkaMicroBatchStream.rateLimit`: each share rounded down, up when below 1, never past the end). That keeps the
+partitions level in records read, not in event time, while the watermark is one value for the query: the latest event
+time over all partitions minus the delay. Where one partition's records span more event time than another's (it holds
+fewer active sessions at that point of a sparse stream), it runs ahead, and the watermark it sets passes records the
+slower partition hasn't delivered yet. A batch drops by the previous batch's watermark, which trails the records it
+reads by the delay plus about one batch's advance in event time ("step"); records are dropped once the partitions'
+lead outgrows that. Larger batches make the step larger, so a backlog read in large batches drops only what is
+really late.
+
+`batching.py` models it without Spark: `rate_limit` and `plan` give an available-now run's batches, the watermark each
+batch logs follows from the records before it, and `check.replay` over those batches gives the drops. On day 3's topic
+the plan equals the real checkpoint's end offsets batch for batch and the drops are the same event ids;
+`tests/test_spark_batching.py` holds a fresh run of the job to the model. `skew` reports the lead (the spread of the
+partitions' latest event times at each batch end) and the step. A live stream at a steady rate keeps the partitions
+close in event time; a backfill of a sparse topic through the streaming path is where this matters, and the batch
+backfill (no watermark) is the answer for history. Spark has no per-partition watermark for Kafka to fix it in place.
+
 ## Data quality (day 4)
 
 `check` (day 2) holds a stopped run to the exact replay of its Kafka records and needs the broker and the checkpoints.
