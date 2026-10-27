@@ -72,15 +72,18 @@ def collect(
     try:
         quality = run_rules(con)
         minutes = con.execute(
+            # A row with a NULL key or value (the rules report it) adds nothing: sum skips NULLs, and a window with
+            # no start has no place on the axis.
             """WITH s AS (SELECT window_start, sum(events) AS events, sum(revenue_cents) AS revenue
-                          FROM minute_aggregates GROUP BY window_start),
-                    b AS (SELECT window_start, sum(events) AS events FROM backfill_aggregates GROUP BY window_start)
+                          FROM minute_aggregates WHERE window_start IS NOT NULL GROUP BY window_start),
+                    b AS (SELECT window_start, sum(events) AS events FROM backfill_aggregates
+                          WHERE window_start IS NOT NULL GROUP BY window_start)
                SELECT window_start, coalesce(s.events, 0), coalesce(s.revenue, 0), b.events
                FROM s FULL JOIN b USING (window_start) ORDER BY window_start"""
         ).fetchall()
         types = con.execute(
-            "SELECT event_type, sum(events), sum(revenue_cents) FROM minute_aggregates "
-            "GROUP BY event_type ORDER BY sum(events) DESC, event_type"
+            "SELECT coalesce(event_type, 'NULL'), coalesce(sum(events), 0), coalesce(sum(revenue_cents), 0) "
+            "FROM minute_aggregates GROUP BY event_type ORDER BY 2 DESC, 1"
         ).fetchall()
     finally:
         con.close()
@@ -129,7 +132,13 @@ _SUMMARY_KEYS = ("count", "p50", "p95", "p99", "max")
 
 
 def _number(value: object) -> bool:
-    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+    """A finite int or float that a float can hold (the page formats them as floats); not a bool."""
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:  # an int past 1.8e308
+        return False
 
 
 def load_bench(path: Path) -> tuple[dict[str, Any], ...]:
@@ -137,7 +146,7 @@ def load_bench(path: Path) -> tuple[dict[str, Any], ...]:
     rows. Runs of a kind the page doesn't know are skipped."""
     try:
         data = json.loads(path.read_text())
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:  # ValueError: JSONDecodeError, or 4,300+ digits
         raise BenchError(f"{path}: not JSON ({exc})") from exc
     if not isinstance(data, list):
         raise BenchError(f"{path}: not a list of benchmark runs")
@@ -170,19 +179,25 @@ _e = html.escape
 
 
 def _n(value: float) -> str:
-    return f"{value:,.0f}"
+    # An int exactly (a float past 2**53 isn't); a float rounded.
+    return f"{value:,}" if isinstance(value, int) else f"{value:,.0f}"
 
 
 def _dollars(cents: int) -> str:
-    return f"${cents / 100:,.2f}"
+    """Integer cents as dollars, exactly: cents / 100 in floats is wrong past 2**53 cents."""
+    dollars, rest = divmod(abs(cents), 100)
+    return f"{'-' if cents < 0 else ''}${dollars:,}.{rest:02d}"
 
 
-def _clock(ms: int) -> str:
-    """The minute as a UTC date and time; a time no calendar holds (the rules report such windows) as its number."""
+def _clock(ms: int, *, date: bool = True) -> str:
+    """The window's start as a UTC date and time (only the time with `date=False`), with seconds and milliseconds
+    when it isn't on a minute; a time no calendar holds as its number. The rules report both kinds of window."""
     try:
-        return datetime.fromtimestamp(ms / 1000, UTC).strftime("%Y-%m-%d %H:%M")
+        moment = datetime.fromtimestamp(ms // 1000, UTC).replace(microsecond=ms % 1000 * 1000)
     except (OverflowError, OSError, ValueError):
         return f"{ms:,} ms"
+    text = moment.strftime("%Y-%m-%d %H:%M" if date else "%H:%M")
+    return text if ms % WINDOW_MS == 0 else f"{text}:{moment.second:02d}.{ms % 1000:03d}"
 
 
 def _money(dollars: float) -> str:
@@ -225,7 +240,9 @@ def bar_chart(
     left, right, top, bottom = 64, 8, 10, 30
     plot_w, plot_h = width - left - right, height - top - bottom
     n = len(labels)
-    totals = [sum(s.values[i] for s in series) if stacked else max(s.values[i] for s in series) for i in range(n)]
+    # Only positive values are drawn (the tables show the rest), so only they size the axis.
+    drawn = [[max(s.values[i], 0.0) for s in series] for i in range(n)]
+    totals = [sum(values) if stacked else max(values) for values in drawn]
     ticks = nice_ticks(max(totals, default=0.0), integer=integer)
     scale = plot_h / ticks[-1]
     out = [
@@ -289,12 +306,13 @@ def _status(ok: bool, good: str = "ok", bad: str = "FAIL") -> str:
 
 def _axis_minutes(minutes: Sequence[Minute]) -> tuple[list[Minute], bool]:
     """The minutes to draw: every minute from the first to the last (zeros where there are no rows) when that is at
-    most a day, else only those with rows. The flag says whether the axis is continuous."""
+    most a day and every window starts on a minute, else only those with rows (a window off the minute grid would
+    fall between the drawn minutes and vanish: day-5 review). The flag says whether the axis is continuous."""
     if not minutes:
         return [], True
     first, last = minutes[0].start_ms, minutes[-1].start_ms
     span = (last - first) // WINDOW_MS + 1
-    if span > MAX_CONTINUOUS_MINUTES:
+    if span > MAX_CONTINUOUS_MINUTES or any(m.start_ms % WINDOW_MS for m in minutes):
         return list(minutes), False
     by_start = {m.start_ms: m for m in minutes}
     empty_backfill = None if minutes[0].backfill_events is None else 0
@@ -307,18 +325,31 @@ def _events_section(r: RunReport) -> str:
     drawn, continuous = _axis_minutes(r.minutes)
     if not drawn:
         return "<h2>Events per minute of event time</h2><p>No windows written yet.</p>"
-    # Within a day the time of day names a minute; over a longer span each label needs its date.
-    labels = [_clock(m.start_ms)[11:] if continuous else _clock(m.start_ms) for m in drawn]
-    note = "" if continuous else "<p class=note>The span is over a day, so only minutes with rows are drawn.</p>"
+    # Within a day the time of day names a minute; otherwise each label needs its date.
+    labels = [_clock(m.start_ms, date=not continuous) for m in drawn]
+    note = (
+        ""
+        if continuous
+        else "<p class=note>The windows span over a day or don't all start on a minute, so only minutes with rows are "
+        "drawn.</p>"
+    )
     if r.has_backfill:
         stream = tuple(float(m.events) for m in drawn)
         late = tuple(float(max((m.backfill_events or 0) - m.events, 0)) for m in drawn)
         series = [Series("counted by the stream", "s1", stream), Series("only in the backfill (late)", "s2", late)]
-        dropped = sum(late)
+        dropped = int(sum(late))
+        below = sum(1 for m in drawn if (m.backfill_events or 0) < m.events)
         intro = (
             f"<p>Each bar is a minute's events in the backfill (the truth of every raw event); the top part is what "
             f"the stream dropped as late: {_n(dropped)} events in all.</p>"
         )
+        if below:
+            # A correct run can't have it (`flowcast check` fails); the table shows the difference (day-5 review).
+            intro += (
+                f"<p class=note>In {_n(below)} minute{'' if below == 1 else 's'} the backfill has fewer events than "
+                "the stream, which a correct run can't have; those bars show the stream's count, and the table the "
+                "difference.</p>"
+            )
         rows: list[tuple[object, ...]] = [
             (_clock(m.start_ms), m.events, m.backfill_events, (m.backfill_events or 0) - m.events) for m in drawn
         ]
@@ -604,5 +635,9 @@ def write(path: Path, report: RunReport) -> None:
     """Write the page next to its final name, then rename it into place: a reader never sees half a page."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(render(report), encoding="utf-8")
-    temporary.replace(path)
+    try:
+        temporary.write_text(render(report), encoding="utf-8")
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise

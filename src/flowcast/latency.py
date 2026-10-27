@@ -137,13 +137,17 @@ def latencies(root: Path) -> Latencies:
     con = duckdb.connect()
     try:
         raw = commits(paths.raw_events)
+        # A row missing the moment is left out of that latency (the quality rules report it).
         for commit in raw:
             for kafka_ms, event_ms in _read(con, commit, "epoch_ms(kafka_timestamp), event_time"):
-                produced.append(commit.committed_ms - kafka_ms)
-                event.append(commit.committed_ms - event_ms)
+                if kafka_ms is not None:
+                    produced.append(commit.committed_ms - kafka_ms)
+                if event_ms is not None:
+                    event.append(commit.committed_ms - event_ms)
         for commit in commits(paths.minute_aggregates):
             for (start,) in _read(con, commit, "window_start"):
-                window.append(commit.committed_ms - (start + WINDOW_MS))
+                if start is not None:
+                    window.append(commit.committed_ms - (start + WINDOW_MS))
     finally:
         con.close()
 
