@@ -60,6 +60,10 @@ report section may be added; a change to any of these is recorded here.
 - `tests/test_docs.py`: every `flowcast` command the documents show parses, every subcommand and script they name
   exists, and the version is the same in pyproject, the package and this file.
 - Tests from a mutation pass over days 4 and 5 (percentile ranks, sink-log deletes, the report's ordering and tiles).
+- Fixes from the day-5 review of the report: NULL keys and moments the rules flag no longer crash it (nor `latency`),
+  a window off the minute grid is drawn, bad results files are refused with a reason (bench numbers within 1e15),
+  money is exact past 2^53 cents, minutes where the backfill is below the stream are called out; tests for the
+  review's surviving mutants.
 - Measured: the trigger interval on a live stream (1, 5 and 10 s, windows closing), throughput over a dense backlog
   (2,000 to 50,000 records a batch), and the parse UDF's cost per record (`scripts/measure_parse.py`); the README in
   release form, with the results at a glance.

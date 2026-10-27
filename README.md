@@ -306,8 +306,9 @@ above (`flowcast quality --out data/bench/kill-d3-size-300`, and so on).
 
 Synthetic data. Apple M3, macOS 26.6.2, Python 3.11.12, PySpark 4.2.0 on Java 21.0.12, Kafka 4.3.1 (one local broker,
 6 partitions). Power: **on AC with the lid open, the Mac awake** (`caffeinate -s -i`), `slept_s` -0.0 for every case
-(wall-clock minus monotonic time, which grows by any sleep); load average 2.5 before the first run; nothing else
-running but this session's editor work (no tests or builds during the runs).
+(wall-clock minus monotonic time, which grows by any sleep); load average 2.5 before the first run. During the
+trigger runs this session also ran short single-process unit tests (the quality and report tests, up to 30 s at a
+time) and one `flowcast report`; during the backlog runs only ruff and mypy.
 
 **Trigger interval on a live stream**, the comparison day 4 couldn't finish: a fresh topic and run per trigger, the
 producer at real time (`--speed 1 --start-ms now`, 100 sessions a second: 373.6 records a second) for 298 s, so each
@@ -461,7 +462,10 @@ Day 5:
   backlog note, stacked against grouped bars, the benchmark tables (a run that closed no window, a sleep of -0.0 s),
   and the command (default path, a missing run, a bad results file).
 - `tests/test_docs.py`: every `.venv/bin/flowcast` command in a bash block of README, DESIGN, WALKTHROUGH and
-  CHANGELOG parses with the CLI's own parser; every `flowcast <subcommand>` and `scripts/...` they name exists.
+  CHANGELOG parses with the CLI's own parser; every `flowcast <subcommand>` and `scripts/...` they name exists; the
+  version is the same in pyproject, the package and CHANGELOG.
+- `tests/test_views.py`: a run whose files all predate schema version 2 has every column (the bug above).
+- `tests/review_d5/`: the day-5 review's findings; `test_latency.py` and `test_report.py` gained the mutation pass's.
 
 CI (`.github/workflows/ci.yml`): lint and types, and every test in two halves on separate runners (`-m spark` and
 `-m "not spark"`; conftest marks every test that takes the `spark` fixture), Spark on Temurin 21 with its jars cached,
@@ -551,6 +555,41 @@ nearest-rank percentile ranked in floats (p99.9 of 1..1000 was 1000). Not fixed 
 decoder's string formats (ids, country, page, category, campaign). Its hypothesis that Spark keeps only 100 progress
 reports doesn't hold here (the session keeps 10,000).
 
+## Review of day 5
+
+One review agent read the day's code at `27d22ac` with a correctness brief, in its own worktree, with no Spark and no
+broker; it wrote each defect it reproduced as a failing test (`tests/review_d5/`, 18 tests in 6 files, all failing at
+`27d22ac`, re-run here), and each now passes:
+
+- **A NULL the rules flag crashed the report** (a window with no start; an event with no event time or Kafka
+  timestamp): `latencies` subtracted None, and so did the per-minute sums. Such rows are left out of that latency and
+  of the sums now; the page is made and shows the failing rule.
+- **A window not starting on a minute vanished** from the chart and the table under it (the continuous axis looks up
+  only whole minutes); the tile still counted it. Any off-minute window now draws only the windows with rows,
+  labelled to the millisecond.
+- **Results files that escaped as tracebacks**: an integer too big for a float, one of more than 4,300 digits (Python
+  3.11's limit), nesting 100,000 deep; and finite latencies that broke the chart (5e-324 made `nice_ticks` take
+  log10 of 0, 1e-10 left an integer axis with one tick, 1.7e308 overflowed). Bench numbers must now be within 1e15.
+- **Money and counts went through floats**, inexact past 2^53 cents; now integer arithmetic.
+- With the backfill below the stream in a minute (which `check` would fail), the text said "0 late events" and
+  nothing else; such minutes are called out now. The test asked for the total to net the shortfall; I kept the total
+  as late events only, since netting would hide late records in other minutes, and changed the test to require the
+  call-out. A negative count (flagged too) made stacked bars overflow the plot.
+- A failed rename left the page's temporary file behind; a calendar-less time on a continuous axis was labelled by a
+  slice of its number.
+
+Its own mutation pass ran 75 mutants of the day's code; 42 survived. The real ones have tests now
+(`tests/test_report_mutants.py`, and spaces at the ends of ids and pages in `test_quality.py`: a rule matching
+`trim(page)` passed every earlier case); the rest are equivalent or cosmetic. Its other judgement calls, left as they
+are and listed in the limitations: `report` exits 0 when the page shows a failure (the page is the product; `quality`
+and `check` are the gates), and it always uses the default dead-letter ceiling. Its check of the string rules (32,000
+strings through RE2 and Python's `re`, NUL, DEL, non-ASCII digits, U+212A and emoji included) found no difference.
+
+Before the review, a mutation pass over days 4 and 5 (23 mutants, each against its file's unit tests) left 5
+survivors; 4 now fail a test (percentile ranks as `ceil(p * n / 100)` in floats, still wrong for 64.4% of 250;
+`commits()` without its deletes; the by-type order; the minutes tile), and the fifth is equivalent. Running the
+quality rules over every run kept on disk found the views bug above (day 2's run).
+
 ## Design decisions
 
 - **Integer cents and integer milliseconds**, so Python, DuckDB and Spark compute identical answers, compared with `==`.
@@ -620,7 +659,8 @@ reports doesn't hold here (the session keeps 10,000).
   snapshot, and `delete_topic` swallowing errors.
 - The report is one run's page, made when asked: it is not a live dashboard, and a run still writing shows the
   batches committed when it was made. Its charts are per minute of event time; a run of days draws only the minutes
-  with rows.
+  with rows. It exits 0 when the page shows a failed rule or check (use `quality` and `check` as gates), uses the
+  default dead-letter ceiling, and its per-minute backfill split nets event types within a minute.
 - Not measured: the job's ceiling beyond 50,000 records a batch, the UDF's per-batch cost (as opposed to its
   per-record cost), and anything on more than one machine.
 

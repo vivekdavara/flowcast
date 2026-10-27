@@ -420,3 +420,11 @@ has, so there was no `campaign` column and every rule naming it failed. The test
 files, never only old ones. `views._create_view` now adds any column no file has as NULL. Smaller: the report first
 showed a benchmark's sleep of -0.0 s as "-0", and labelled a count axis's 0.5 tick as "0". And the Mac went to sleep
 with its lid closed at 15:45 for 93 minutes; the commits after that are bunched at the end.
+
+**What did the day-5 review find?**
+That "odd input is shown, not fatal" wasn't true yet. The report crashed on NULLs the quality rules exist to flag (a
+window with no start, an event with no event time), lost a window that doesn't start on a minute (the continuous axis
+only looks up whole minutes), let three kinds of bad results file through as tracebacks, and formatted money through
+floats. Each is a test in `tests/review_d5/` now. The judgement call: when the backfill is below the stream in a
+minute, the reviewer's test wanted the page's "late events in all" to net it; I kept that total as late events only
+and made the page name such minutes, because netting a shortfall against other minutes' late records would hide them.
