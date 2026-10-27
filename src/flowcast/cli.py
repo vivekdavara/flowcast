@@ -18,7 +18,7 @@ from pathlib import Path
 
 import duckdb
 
-from flowcast import __version__
+from flowcast import __version__, report
 from flowcast.check import CheckpointError, check_run
 from flowcast.generator import Config, Emitted, Generator
 from flowcast.kafka_io import (
@@ -203,6 +203,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=MAX_DEAD_LETTER_RATE,
         help="the largest share of records that may be dead letters (default %(default)s)",
     )
+
+    page = sub.add_parser("report", help="write a static HTML report of a run (no Kafka needed without --topic)")
+    page.add_argument("--out", type=Path, default=DEFAULT_OUT, help="the run's directory (default %(default)s)")
+    page.add_argument("--html", type=Path, help="the page to write (default: report.html in the run's directory)")
+    page.add_argument("--topic", help="also run the exact check against this topic (needs the broker)")
+    page.add_argument("--bootstrap", default=DEFAULT_BOOTSTRAP, help="for --topic (default %(default)s)")
+    page.add_argument("--wait", type=_seconds, default=30.0, help="for --topic (default %(default)s)")
+    page.add_argument("--bench", type=Path, help="a scripts/bench.py results.json to add")
 
     query = sub.add_parser("query", help="run SQL over a run's DuckDB views and print CSV")
     query.add_argument("sql", help="e.g. 'SELECT * FROM minute_aggregates ORDER BY window_start LIMIT 10'")
@@ -399,6 +407,23 @@ def _backfill(args: argparse.Namespace) -> None:
     )
 
 
+def _report(args: argparse.Namespace) -> None:
+    if not args.out.is_dir():
+        raise UsageError(f"{args.out}: no run directory there")
+    check = check_run(args.bootstrap, args.topic, args.out, timeout_s=args.wait) if args.topic else None
+    generated = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    try:
+        data = report.collect(args.out, generated, check=check, bench=args.bench)
+    except report.BenchError as exc:
+        raise StreamFailed(str(exc)) from exc
+    path = args.html or args.out / "report.html"
+    report.write(path, data)
+    verdicts = [f"quality {'ok' if data.quality.ok else 'FAILED'}"]
+    if check is not None:
+        verdicts.append(f"check {'ok' if check.ok else 'MISMATCH'}")
+    print(f"wrote {path} ({', '.join(verdicts)})")
+
+
 def _query(args: argparse.Namespace) -> None:
     try:
         con = connect(args.out)
@@ -437,6 +462,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "quality": _quality,
         "latency": _latency,
         "backfill": _backfill,
+        "report": _report,
     }
     if args.command == "version":
         print(f"flowcast {__version__}")

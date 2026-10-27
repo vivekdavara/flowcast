@@ -362,6 +362,33 @@ upstream or files something else changed:
   fewer is allowed). That last one is only conclusive on a stopped run: during one, `raw_events` can trail
   `minute_aggregates` by a batch.
 
+## The report (day 5)
+
+`flowcast report --out RUN [--html FILE] [--topic TOPIC] [--bench results.json]` writes one static HTML page about a
+run: the row counts, events and revenue per minute of event time (with a published backfill, each minute's bar split
+into what the stream counted and what only the backfill has: the late records), events by type, the latencies and
+throughput, every data-quality rule, and with `--topic` the exact check; with `--bench`, `scripts/bench.py`'s results
+as tables and a chart of latency by trigger.
+
+- **Self-contained**: inline CSS and SVG, no scripts, nothing fetched. It opens from disk and can be attached to a
+  release; a test refuses `<script`, `src=`, `href=`, `url(` and `://` in the page.
+- **The same numbers as the terminal**: it calls `run_rules`, `latencies`, `throughput` and `check_run`, the functions
+  `quality`, `latency` and `check` print. Its own SQL is only the per-minute and per-type sums of the views.
+- **`collect` then `render`**: `collect` reads the run into a `RunReport`; `render` is a pure function of it, so the
+  same numbers give the same bytes (tested) and every value from the run is HTML-escaped in one place.
+- **Charts**: bars, one per minute, on a continuous minute axis when the run spans at most a day (empty minutes are
+  gaps); a longer span (an event decades away is valid input) draws only the minutes with rows and says so. Each bar
+  has an SVG `<title>` (the browser's hover), each chart a table with the same numbers, two-series charts a legend, and
+  the colours (blue and orange, an ordinal blue ramp for p50/p95/p99) pass a colour-vision check in light and dark
+  mode. Status is an icon and a word, never colour alone.
+- **Honest labels**: a run whose events were produced more than a day after their event times (a backlog) says that
+  its event-time and window-end latencies measure the backlog, not the pipeline; throughput says that it covers only
+  the rounds of a run that ended (a killed round saves no progress reports).
+- **Odd input is shown, not fatal**: a window at a time no calendar holds (the rules flag it) is labelled by its
+  number; `--bench` files are checked against what `bench.py` writes (a list of runs, each known kind's rows with
+  finite numbers) before anything is drawn, so a bad file is exit 1 with the reason; unknown kinds are skipped.
+- Written to a temporary name and renamed into place.
+
 ## Testing
 
 - Unit and property tests (pytest, Hypothesis) for the schema, the generator's invariants and the truth.
