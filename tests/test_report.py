@@ -206,7 +206,7 @@ def test_a_backlog_says_its_event_time_latency_isnt_the_pipelines(tmp_path: Path
     # Produced three days after the events happened (a replayed backlog).
     data["raw_events"] = [{**row, "kafka_timestamp": "2026-01-04 00:00:00+00"} for row in data["raw_events"]]
     page = render(collect(run_dir(tmp_path, data), GENERATED))
-    assert "were produced 3 days after their event times" in page
+    assert "were produced 3.0 days after their event times" in page
     live = render(collect(run_dir(tmp_path / "live", clean()), GENERATED))
     assert "days after their event times" not in live
 

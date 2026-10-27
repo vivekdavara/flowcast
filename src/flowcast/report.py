@@ -131,12 +131,17 @@ _BENCH_KEYS = {
 _SUMMARY_KEYS = ("count", "p50", "p95", "p99", "max")
 
 
+# Far above any count, millisecond or second a benchmark here records, and far below where a chart's arithmetic
+# overflows (a p99 of 1.7e308 did: day-5 review).
+MAX_BENCH_NUMBER = 1e15
+
+
 def _number(value: object) -> bool:
-    """A finite int or float that a float can hold (the page formats them as floats); not a bool."""
+    """An int or float of at most MAX_BENCH_NUMBER either way; not a bool, NaN or infinity."""
     if not isinstance(value, int | float) or isinstance(value, bool):
         return False
     try:
-        return math.isfinite(float(value))
+        return abs(float(value)) <= MAX_BENCH_NUMBER  # False for NaN
     except OverflowError:  # an int past 1.8e308
         return False
 
@@ -159,7 +164,10 @@ def load_bench(path: Path) -> tuple[dict[str, Any], ...]:
             continue
         for row in run["rows"]:
             if not isinstance(row, dict) or not all(_number(row.get(k)) for k in keys):
-                raise BenchError(f"{path}: run {number} ({run['bench']}): a row without {', '.join(keys)} as numbers")
+                raise BenchError(
+                    f"{path}: run {number} ({run['bench']}): a row without {', '.join(keys)} as numbers "
+                    f"(at most {MAX_BENCH_NUMBER:g})"
+                )
             if run["bench"] == "sizes" and not isinstance(row.get("check_ok"), bool):
                 raise BenchError(f"{path}: run {number} (sizes): a row without check_ok")
             for name in ("produced_ms", "event_ms", "window_ms"):
@@ -167,7 +175,7 @@ def load_bench(path: Path) -> tuple[dict[str, Any], ...]:
                 if summary is not None and not (
                     isinstance(summary, dict) and all(_number(summary.get(k)) for k in _SUMMARY_KEYS)
                 ):
-                    raise BenchError(f"{path}: run {number} (triggers): {name} isn't a latency summary")
+                    raise BenchError(f"{path}: run {number} ({run['bench']}): {name} isn't a latency summary")
         runs.append(run)
     return tuple(runs)
 
@@ -207,14 +215,14 @@ def _money(dollars: float) -> str:
 def nice_ticks(top: float, count: int = 4, *, integer: bool = False) -> list[float]:
     """Axis ticks from 0 to at least `top` in steps of 1, 2 or 5 times a power of ten (at least 1 for `integer`
     quantities such as counts, which a tick at 0.5 would mislabel)."""
-    if top <= 0:
+    if not top > 1e-9:  # nothing to show (or less than a float can step through): a unit axis
         return [0.0, 1.0]
     raw = top / count
     power = 10 ** math.floor(math.log10(raw))
     step = next(m * power for m in (1, 2, 5, 10) if m * power >= raw)
     if integer:
         step = max(step, 1)
-    return [i * step for i in range(math.ceil(top / step - 1e-9) + 1)]
+    return [i * step for i in range(max(1, math.ceil(top / step - 1e-9)) + 1)]
 
 
 @dataclass(frozen=True)
@@ -404,7 +412,7 @@ def _latency_section(r: RunReport) -> str:
             behind = (lat.event.p50 - lat.produced.p50) / 86_400_000
             if behind > 1:
                 out.append(
-                    f"<p class=note>This run's events were produced {behind:,.0f} days after their event times (a "
+                    f"<p class=note>This run's events were produced {behind:,.1f} days after their event times (a "
                     "backlog, not a live stream), so the event-time and window-end rows measure that, not the "
                     "pipeline.</p>"
                 )
