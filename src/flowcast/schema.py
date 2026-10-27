@@ -36,6 +36,18 @@ _CATEGORY = re.compile(r"[a-z_]{1,32}")
 _PAGE = re.compile(r"/[\x21-\x7e]{0,255}")
 # A marketing campaign's name, as a utm_campaign tag: lowercase letters, digits, `_` and `-`.
 _CAMPAIGN = re.compile(r"[a-z0-9_-]{1,64}")
+# Each string field's format, matched whole. The data-quality rules (quality.py) restate them in SQL, so they are
+# kept to what Python's re and DuckDB's RE2 read the same way: ASCII classes and counted repeats.
+STRING_FORMATS: dict[str, re.Pattern[str]] = {
+    "event_id": _UUID,
+    "user_id": _USER,
+    "session_id": _SESSION,
+    "country": _COUNTRY,
+    "page": _PAGE,
+    "product_id": _PRODUCT,
+    "category": _CATEGORY,
+    "campaign": _CAMPAIGN,
+}
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,7 +4,9 @@
 checkpoints. These rules need neither: each is a query over what a reader of the outputs sees, so they also run on a
 copy of the Parquet files, or while the job is still writing. A rule counts the rows that break it; a run passes when
 every count is 0. They restate what the decoder and the job promise (every raw event is one the decoder would accept,
-a window is written once, ...), so a failure means a bug upstream or files that something else changed.
+a window is written once, ...), so a failure means a bug upstream or files that something else changed. Over the
+columns the views have, a raw event passes every row rule exactly when the decoder accepts it (tests/test_quality.py
+holds the two to each other).
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from flowcast.schema import (
     PRODUCT_TYPES,
     QUANTITY_TYPES,
     SCHEMA_VERSIONS,
+    STRING_FORMATS,
 )
 from flowcast.views import connect
 
@@ -53,6 +56,14 @@ _REQUIRED = (
     "kafka_timestamp",
     "event_date",
 )
+
+
+def _not_matching(column: str, pattern: str) -> str:
+    """SQL that is true when the column's value isn't wholly in the decoder's format; NULL for a NULL value (the
+    required-fields and product-fields rules say which may be NULL)."""
+    return f"""NOT regexp_full_match("{column}", '{pattern.replace("'", "''")}')"""
+
+
 _PRODUCT = f"coalesce(event_type IN {_in(PRODUCT_TYPES)}, false)"
 _QUANTITY = f"coalesce(event_type IN {_in(QUANTITY_TYPES)}, false)"
 
@@ -73,6 +84,10 @@ ROW_RULES = (
     Rule("required fields set", "raw_events", " OR ".join(f'"{c}" IS NULL' for c in _REQUIRED), _RECORD),
     Rule("known event type", "raw_events", f"event_type NOT IN {_in(EVENT_TYPES)}", _RECORD),
     Rule("known device", "raw_events", f"device NOT IN {_in(DEVICES)}", _RECORD),
+    *(
+        Rule(f"{field} in the decoder's format", "raw_events", _not_matching(field, pattern.pattern), _RECORD)
+        for field, pattern in STRING_FORMATS.items()
+    ),
     Rule(
         "known schema version, campaign only in version 2",
         "raw_events",

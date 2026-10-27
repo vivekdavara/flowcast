@@ -350,7 +350,11 @@ upstream or files something else changed:
 
 - Raw events, row by row: required fields set; known event type, device and schema version, `campaign` only in
   version 2; event time in range; product fields present exactly for product events and quantity exactly for
-  quantity events; price and quantity in range; `event_date` is the event time's UTC date.
+  quantity events; price and quantity in range; `event_date` is the event time's UTC date; and (day 5, the day-4
+  review's open finding) every string field in the decoder's format: `schema.STRING_FORMATS`, the decoder's own
+  patterns, given to DuckDB's `regexp_full_match`. They use only what Python's `re` and DuckDB's RE2 read the same way
+  (ASCII classes, counted repeats). Over the columns the views have, a raw event now passes every row rule exactly
+  when `decode` accepts it; a Hypothesis test holds the two to each other on edited generated events.
 - Windows, row by row: a known event type; starting on a minute; positive counts; revenue only from purchases.
 - Dead letters: a reason and the record's coordinates; at most 1% of records (`--max-dead-letter-rate`).
 - Across rows: each Kafka record once, as a raw event or a dead letter; each window and event type once; no window
