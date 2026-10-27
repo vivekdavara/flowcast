@@ -127,21 +127,35 @@ def orphan_files(sink: Path) -> list[Path]:
     return [path for path in data_files(sink) if path.resolve() not in committed]
 
 
-def _view_sql(name: str, files: list[Path], *, date_partition: str | None = None) -> str:
-    """The view over `files`. Spark keeps a partition column (`date_partition`) only in the directory name, so it is
+def _view_select(name: str, files: list[Path], *, date_partition: str | None = None) -> str:
+    """The query over `files`. Spark keeps a partition column (`date_partition`) only in the directory name, so it is
     read from each file's own parent directory: DuckDB's hive_partitioning would take every key=value segment of
     the whole absolute path, and a run under ".../trigger=5/" would gain a `trigger` column (day-2 review)."""
     if not files:
         columns = ", ".join(f"NULL::{kind} AS {column}" for column, kind in COLUMNS[name].items())
-        return f"CREATE OR REPLACE VIEW {name} AS SELECT {columns} WHERE false"
+        return f"SELECT {columns} WHERE false"
     listed = ", ".join("'" + str(f).replace("'", "''") + "'" for f in files)
     # union_by_name: files written before schema version 2 have no campaign column; matched by name, their rows read
     # it as null (by position, DuckDB would refuse the mismatch, or worse, pair up columns that merely line up).
     if date_partition is None:
-        return f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM read_parquet([{listed}], union_by_name = true)"
+        return f"SELECT * FROM read_parquet([{listed}], union_by_name = true)"
     date = f"CAST(regexp_extract(filename, '/{date_partition}=([^/]+)/[^/]+$', 1) AS DATE) AS {date_partition}"
     source = f"read_parquet([{listed}], hive_partitioning = false, filename = true, union_by_name = true)"
-    return f"CREATE OR REPLACE VIEW {name} AS SELECT * EXCLUDE (filename), {date} FROM {source}"
+    return f"SELECT * EXCLUDE (filename), {date} FROM {source}"
+
+
+def _create_view(
+    con: duckdb.DuckDBPyConnection, name: str, files: list[Path], *, date_partition: str | None = None
+) -> None:
+    """The view over `files`, with every column of COLUMNS[name]. union_by_name gives a column only if some file has
+    it, so a run whose files all predate schema version 2 has no campaign column at all, and every query naming it
+    (the quality rules do) failed to bind; such a column is added as NULL, as it would read beside newer files."""
+    select = _view_select(name, files, date_partition=date_partition)
+    present = {row[0] for row in con.execute(f"DESCRIBE {select}").fetchall()}
+    missing = [f"NULL::{kind} AS {column}" for column, kind in COLUMNS[name].items() if column not in present]
+    if missing:
+        select = f"SELECT *, {', '.join(missing)} FROM ({select})"
+    con.execute(f"CREATE OR REPLACE VIEW {name} AS {select}")
 
 
 def connect(root: Path, database: str = ":memory:") -> duckdb.DuckDBPyConnection:
@@ -150,12 +164,12 @@ def connect(root: Path, database: str = ":memory:") -> duckdb.DuckDBPyConnection
     paths = Paths(root)
     con = duckdb.connect(database)
     try:
-        con.execute(_view_sql("raw_events", committed_files(paths.raw_events), date_partition="event_date"))
-        con.execute(_view_sql("minute_aggregates", committed_files(paths.minute_aggregates)))
-        con.execute(_view_sql("dead_letters", committed_files(paths.dead_letters)))
+        _create_view(con, "raw_events", committed_files(paths.raw_events), date_partition="event_date")
+        _create_view(con, "minute_aggregates", committed_files(paths.minute_aggregates))
+        _create_view(con, "dead_letters", committed_files(paths.dead_letters))
         # A backfill is published whole (its directory named by the CURRENT pointer), so every file in it counts.
         backfill = current_backfill(paths)
-        con.execute(_view_sql("backfill_aggregates", sorted(backfill.glob("*.parquet")) if backfill else []))
+        _create_view(con, "backfill_aggregates", sorted(backfill.glob("*.parquet")) if backfill else [])
     except BaseException:
         con.close()
         raise

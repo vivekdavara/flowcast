@@ -176,6 +176,32 @@ def test_orphan_files_are_the_data_files_no_batch_lists(tmp_path: Path) -> None:
     assert orphan_files(tmp_path / "missing") == []
 
 
+def test_a_run_whose_files_all_predate_schema_version_2_still_has_a_campaign_column(tmp_path: Path) -> None:
+    """union_by_name only gives a column some file has: day 2's runs have none with campaign, and `flowcast quality`
+    failed on them with a binder error (found on day 5 by running the rules over every kept run)."""
+    day = tmp_path / "raw_events" / "event_date=2026-01-01"
+    day.mkdir(parents=True)
+    v1_columns = ", ".join(
+        f"{'0' if kind in ('INTEGER', 'BIGINT') else 'NULL'}::{kind} AS {column}"
+        for column, kind in COLUMNS["raw_events"].items()
+        if column not in ("campaign", "event_date")
+    )
+    with duckdb.connect() as con:
+        con.execute(f"COPY (SELECT {v1_columns}) TO '{day / 'part-0.parquet'}'")
+    log_file(tmp_path / "raw_events", "0", [(day / "part-0.parquet", "add")])
+    con = connect(tmp_path)
+    try:
+        columns = {row[0]: row[1] for row in con.execute("DESCRIBE raw_events").fetchall()}
+        assert set(columns) == set(COLUMNS["raw_events"])
+        assert columns["campaign"] == "VARCHAR"
+        assert con.execute("SELECT count(*), count(campaign) FROM raw_events").fetchone() == (1, 0)
+        # Every view has every column of its table, whatever its files hold.
+        for view in ("minute_aggregates", "dead_letters", "backfill_aggregates"):
+            assert {row[0] for row in con.execute(f"DESCRIBE {view}").fetchall()} == set(COLUMNS[view])
+    finally:
+        con.close()
+
+
 def test_raw_files_from_before_and_after_schema_version_2_read_as_one_view(tmp_path: Path) -> None:
     # A job upgraded in place: its first batches wrote files with no campaign column, later ones with it.
     day = tmp_path / "raw_events" / "event_date=2026-01-01"
