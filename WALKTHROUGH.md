@@ -344,3 +344,66 @@ answer "is this data sane" from the Parquet files alone, so they run on a copy, 
 something other than the job touched the files. Each is SQL that counts the rows breaking it (an unknown event type,
 a window off the minute, a Kafka record that's both an event and a dead letter, a window counting more than the raw
 events behind it), so a failure names its rows.
+
+## The report, the string rules and the release (day 5)
+
+**What does `flowcast report` show, and why a static page?**
+One HTML file per run: row counts, events and revenue per minute of event time, events by type, the latencies and
+throughput, every data-quality rule with its verdict, the exact check when given `--topic`, and `scripts/bench.py`'s
+results when given `--bench`. Static because it has to outlive the run: no server, no scripts, nothing fetched, so it
+opens from disk or as a release asset and shows the same thing later. A test refuses `<script`, `src=`, `href=`,
+`url(` and `://` in the page.
+
+**How do you know the page's numbers are right?**
+It doesn't compute its own: `collect` calls `run_rules`, `latencies`, `throughput` and `check_run`, the same functions
+`flowcast quality`, `latency` and `check` print, and its only SQL is two sums over the views (per minute, per type).
+`render` is a pure function of the collected numbers, so the tests build runs by hand (Parquet files and sink logs, no
+Spark) and check the page for exact cells; the same numbers always give the same bytes.
+
+**What does the stacked chart mean?**
+With a published backfill, each minute's bar is the backfill's events for that minute (the truth of every raw event,
+very late ones included), split into what the stream counted and what only the backfill has. The top part is the
+records the stream dropped as late. On day 3's kill run that is 1,574 events: 1,263 in rows both wrote, and 311 in 29
+rows (a minute and an event type) the stream never wrote, because every record of them came after the watermark.
+
+**Why does the page say a run's event-time latency isn't the pipeline's?**
+Because on a backlog it isn't: day 3's kill run replayed events from January, so "event time to queryable" is ten
+months. The page compares the medians of event time and produced time to queryable, and when they are more than a
+day apart says the run was a backlog. The CLI's `latency` prints the numbers either way.
+
+**What did the day-4 review leave open, and how is it closed?**
+The quality rules didn't restate the decoder's string formats (ids, country, page, category, campaign), though the
+module said a raw event passing them was one the decoder would accept. `schema.STRING_FORMATS` now holds the decoder's
+own patterns, and the rules give them to DuckDB's `regexp_full_match`; they use only what Python's `re` and RE2 read
+the same way. A Hypothesis test takes generated events, replaces up to three fields with values on either side of
+each rule (a 32-digit user id, `USA`, a page with a space or DEL, a non-ASCII digit, NULL), and requires that the row
+passes every rule exactly when `decode` accepts its JSON. Removing the page rule makes it fail with `"page": ""`.
+
+**How fresh is the data, and what sets it?**
+At a 1 s trigger, half of all events were queryable 1.05 s after they were produced and 95% within 1.9 s (100 sessions
+a second, 112,079 records, five minutes on a live stream; README "Results (day 5)"). A row waits for the next batch,
+half the interval on average, then for that batch's work and commit; at 5 and 10 s the median is half the interval plus
+0.4 to 0.5 s. The batch's work is mostly fixed cost: raw_events' batches took 0.79 s each at 389 records and 0.77 s at
+3,615, so at 1 s the queries were busy 76 to 95% of the time and the trigger can't go much lower on this laptop.
+
+**And how fresh is a minute's count?**
+Three minutes late, by design: the watermark trails the newest event time by 180 s so that records up to three
+minutes late still count. A minute's row is written 182.4 s after the minute ends at a 1 s trigger, 190.7 s at 5 s and
+200.7 s at 10 s: the delay plus about two trigger intervals, because a batch runs with the previous batch's watermark,
+so the batch after the one that first sees an event time past the window's end plus 180 s writes it. If a product
+needed fresher minutes, the choice is between a shorter delay (more records dropped as late, which `check` would
+count exactly) and emitting early results that are later corrected (update mode, which the Parquet sink can't do).
+
+**Why not a 100 ms trigger, then?**
+Because the cost per batch is fixed and the queries were already busy 95% of the time at 1 s: at a shorter interval
+the batches would run back to back and fall behind, and latency would grow instead of shrink. A lower floor needs
+less work per batch: one query reading Kafka and parsing once (today four queries each do), or a different engine
+for the fresh path. Spark's experimental continuous trigger supports only map-like queries, not these windows or the
+deduplication.
+
+**What's the job's throughput?**
+Over a dense backlog of 200,000 records, 18,139 rows a second through raw_events' batches at 50,000 records a batch
+(10,911 over the whole 18.3 s run, Spark's start included), against 3,828 at 2,000 a batch. The rate grows with the
+batch because each batch carries a fixed cost; on the live stream at 375 records a second the job was nowhere near
+that ceiling at 5 and 10 s triggers (busy 8 to 17% of the time) and near it at 1 s. Those are one laptop's numbers in
+local mode, four queries sharing its cores.

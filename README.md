@@ -16,10 +16,24 @@ result can be checked against it.
 | 2 | Producer at volume; the Spark job (validate, dead letters, raw events, windowed aggregates); DuckDB views; the exact check | done |
 | 3 | Exactly-once across killed and restarted jobs (file sinks, an idempotent DuckDB sink, SIGKILL tests); late-data accounting against Spark's metrics; schema version 2; batch backfill | done |
 | 4 | Latency and throughput from the sink logs; benchmarks over batch sizes and trigger intervals; why small batches drop on-time records (a model of Spark's split, checked against the job); data-quality rules | done |
-| 5 | Static HTML report, results, walkthrough, v1.0.0 | |
+| 5 | A static HTML report of a run; quality rules for the decoder's string formats; the trigger comparison with windows closing; docs checked against the CLI; v1.0.0 | done |
 
 [DESIGN.md](DESIGN.md) is the specification for all five days; [WALKTHROUGH.md](WALKTHROUGH.md) has the questions an
 interviewer is likely to ask, with answers grounded in the code.
+
+## Results at a glance
+
+Synthetic data, one Apple M3 laptop, Spark in local mode; each line's section has the conditions and the command.
+
+| What | Result | Section |
+|---|---|---|
+| Exactly once across crashes | every output equal to the replay of the job's own batches after 10 SIGKILLs and 11 starts (11,966 events; the DuckDB sink 494 of 494 rows) | Results (day 3) |
+| Spark's late-data metrics | its dropped and duplicate counts equal the replay's, batch by batch (1,267 and 71) | Results (day 3) |
+| Fresh data, live stream | produced to queryable **p50 1,048 ms, p95 1,924 ms** at a 1 s trigger (2,925 / 5,187 at 5 s; 5,492 / 9,994 at 10 s) | Results (day 5) |
+| A minute's count | queryable **182.4 s** after the minute ends at a 1 s trigger: the 3-minute watermark plus about two triggers | Results (day 5) |
+| Throughput, dense backlog | **18,139 rows/s** through the job's batches at 50,000 records a batch, 3,828 at 2,000 | Results (day 5) |
+| Late drops from batch size | 300-record batches over a sparse backlog dropped 10.69% as late (1,200 of the 1,280 were on time), 10,000-record batches 0; a model of Spark's split predicts every count exactly | Results (day 4) |
+| Data quality | the 25 rules and the dead-letter ceiling pass on every run measured; the raw-event rules accept exactly what the decoder accepts | Results (day 4), Tests (day 5) |
 
 ## Architecture
 
@@ -40,10 +54,12 @@ flowchart LR
   D -.-> C
 ```
 
-Built so far (days 1 to 3): the whole pipeline; an exact check of its output; exactly-once across a job killed with
-SIGKILL mid-batch and restarted (and what the kills taught about Spark's watermark); Spark's own late-row metrics
-checked against the replay batch by batch; schema version 2 with readers of both; and a batch backfill that reuses the
-stream's transformations and must equal the truth of every event.
+Built (v1.0.0): the whole pipeline; an exact check of its output; exactly-once across a job killed with SIGKILL
+mid-batch and restarted (and what the kills taught about Spark's watermark); Spark's own late-row metrics checked
+against the replay batch by batch; schema version 2 with readers of both; a batch backfill that reuses the stream's
+transformations and must equal the truth of every event; latency and throughput measured from the sinks' own commit
+times, and a model of Spark's batch split that explains its late drops; data-quality rules equal to the decoder; and a
+static HTML report of any run.
 
 ## Layout
 
@@ -61,13 +77,20 @@ src/flowcast/
   restarts.py             each query's state at every start (which re-run batches the file sink skipped)
   recovery.py             kill the running job with SIGKILL at random moments, restart it
   layout.py               where a run writes (an output and a checkpoint per query, progress, backfill)
-  check.py                the replay of a run's batches over Kafka, late-data accounting, and the report
+  check.py                the replay of a run's batches over Kafka, late-data accounting, and the check's report
   views.py                DuckDB views from the file sinks' logs; orphan files
+  latency.py              produced / event time / window end to queryable, from the sink logs; throughput
+  batching.py             Spark's batch split (rateLimit) and the watermarks it gives, without Spark
+  quality.py              data-quality rules as SQL over the views
+  report.py               the static HTML report of a run
   cli.py                  flowcast generate | truth | topic | produce | count | stream | check | backfill | query
+                                   | latency | quality | report | version
 scripts/kafka.sh          local single-node Kafka (start/stop/status/bootstrap/logs/reset)
 scripts/kill_restart.py   the kill-and-restart run at size
-scripts/measure_generator.py, scripts/measure_encode.py
-tests/                    unit, property, differential, Kafka and Spark tests
+scripts/bench.py          the batch-size and trigger-interval benchmarks
+scripts/measure_generator.py, scripts/measure_encode.py, scripts/measure_parse.py
+tests/                    unit, property, differential, Kafka and Spark tests; tests/test_docs.py runs the
+                          commands these documents show through the CLI's parser
 ```
 
 ## How to run
@@ -83,7 +106,8 @@ make check
 ```
 
 `make check` runs ruff, ruff format, mypy --strict and the tests, Kafka and Spark ones included (they use their own
-topics and delete them; about two minutes). `make kafka-stop` stops the broker; `scripts/kafka.sh reset` deletes its data.
+topics and delete them; 4m38s for 382 tests on an M3 at `807cdc9`). `make kafka-stop` stops the broker;
+`scripts/kafka.sh reset` deletes its data.
 
 Try the pieces:
 
@@ -131,6 +155,17 @@ Measure a run and check its data (day 4):
 .venv/bin/python scripts/bench.py sizes --topic kill-d3 --sizes 300,2000,10000
 .venv/bin/python scripts/bench.py triggers --topic live --seconds 300 --sessions-per-second 100 --triggers 1,5,10
 ```
+
+A page of it all (day 5):
+
+```bash
+.venv/bin/flowcast report --out data/demo
+.venv/bin/flowcast report --out data/demo --topic demo --html data/demo.html
+.venv/bin/flowcast report --out data/bench/live-d5-1s --bench data/bench/results.json
+```
+
+`report` writes `report.html` in the run's directory (or `--html`): one self-contained page (no scripts, nothing
+fetched) with the windows per minute, the latencies, every quality rule and, with `--topic`, the exact check.
 
 `latency` prints produced, event time and window end to queryable (p50, p95, p99, max) and each query's throughput;
 event time is only meaningful for a run fed by `produce --speed 1 --start-ms now`. `quality` exits 1 when a rule
@@ -260,6 +295,78 @@ every event time. The pacer now runs against the wall clock from that moment (`c
 run (11,966 raw events, 494 windows, 3 dead letters: 0.0251% of records), and on each of the three batch-size runs
 above (`flowcast quality --out data/bench/kill-d3-size-300`, and so on).
 
+## Results (day 5, v1.0.0)
+
+Synthetic data. Apple M3, macOS 26.6.2, Python 3.11.12, PySpark 4.2.0 on Java 21.0.12, Kafka 4.3.1 (one local broker,
+6 partitions). Power: **on AC with the lid open, the Mac awake** (`caffeinate -s -i`), `slept_s` -0.0 for every case
+(wall-clock minus monotonic time, which grows by any sleep); load average 2.5 before the first run; nothing else
+running but this session's editor work (no tests or builds during the runs).
+
+**Trigger interval on a live stream**, the comparison day 4 couldn't finish: a fresh topic and run per trigger, the
+producer at real time (`--speed 1 --start-ms now`, 100 sessions a second: 373.6 records a second) for 298 s, so each
+run's first full minutes close (the watermark trails by 3 minutes):
+
+| Trigger | Records | raw_events batches with rows | Produced to queryable p50 / p95 / p99 | Event time to queryable p50 / p95 / p99 | Window end to queryable p50 (rows) |
+|---|---|---|---|---|---|
+| 1 s | 112,079 | 288 | **1,048 / 1,924 / 3,057 ms** | 1,197 / 2,772 / 20,288 ms | **182.4 s** (12) |
+| 5 s | 112,079 | 61 | **2,925 / 5,187 / 5,432 ms** | 3,135 / 5,474 / 22,307 ms | **190.7 s** (12) |
+| 10 s | 112,079 | 31 | **5,492 / 9,994 / 10,405 ms** | 5,763 / 10,356 / 25,141 ms | **200.7 s** (12) |
+
+`.venv/bin/python scripts/bench.py --out data/bench triggers --topic live-d5 --seconds 300 --sessions-per-second 100
+--triggers 1,5,10` at `1be455a` (15:04:47 to 15:21:40; schema.py had today's uncommitted `STRING_FORMATS` constant,
+which nothing in the job reads). `flowcast check` passed on the 1 s run. What it says:
+
+- **Fresh data is half the trigger plus the batch's work.** A row waits for the next batch (half the interval on
+  average) and then for that batch to run and commit: the median is half the interval plus 0.4 to 0.5 s at 5 and 10 s,
+  and p95 approaches the whole interval.
+- **A batch costs about the same whatever its size**: from the progress reports (`flowcast latency` on each run),
+  raw_events' batches took 0.79 s each at 1 s (389 records a batch), 0.67 s at 5 s and 0.77 s at 10 s (3,615 records),
+  493 against 4,711 records per busy second. The cost is fixed overhead (planning, four queries each reading and
+  parsing Kafka, writing Parquet, committing logs), so at 1 s the queries were busy 76% (raw_events) to 95%
+  (minute_aggregates) of the time: this laptop can't go much below 1 s at this rate.
+- **A minute's answer waits for the watermark**: 180 s after the window ends plus about two trigger intervals (2.4 s
+  at 1 s, 10.7 s at 5 s, 20.7 s at 10 s). A batch runs with the previous batch's watermark, so the window is written
+  by the batch after the one that first reads an event time past its end plus 180 s. Each run closed 2 minutes (12
+  rows: 2 minutes x 6 event types) before it stopped. The watermark, not the trigger, dominates: a minute's count
+  first appears 3 minutes after the minute, the price of counting events up to 3 minutes late.
+- The event-time p99 (20 to 25 s) is the late records: 3% arrive up to 2 minutes late, by design.
+
+**Throughput over a dense backlog**, the other run day 4 left: 200,000 records at the generator's default rate (20
+sessions a second: about 45 minutes of event time), produced unpaced at 190,388 records a second, then read from
+nothing by `flowcast stream --available-now --max-offsets SIZE`, a fresh process and run per size:
+
+| Records a batch | Batches | Wall time (JVM start included) | Records/s over the wall time | raw_events rows/s over its batches | Dropped as late | Predicted |
+|---|---|---|---|---|---|---|
+| 2,000 | 101 | 86.0 s | 2,325 | 3,828 | 238 (0.119%) | 238 |
+| 10,000 | 21 | 39.9 s | 5,009 | 11,408 | 226 (0.113%) | 226 |
+| 50,000 | 5 | 18.3 s | **10,911** | **18,139** | 84 (0.042%) | 84 |
+
+`.venv/bin/python scripts/bench.py --out data/bench sizes --topic bench-backlog --records 200000 --sizes
+2000,10000,50000` at `807cdc9` (15:27 to 15:30, `check` ok on all three, `slept_s` 0.0). The same fixed cost per
+batch as on the live stream: from 2,000 to 50,000 records a batch the rate over the job's batches grows 4.7 times
+(3,828 to 18,139 rows a second), and the 18.3 s wall time at 50,000 includes Spark's start. What a dense stream drops
+is what is really late (by design 0.2% of records are 5 to 30 minutes late), and the model of Spark's split predicts
+each count exactly again. Fewer are dropped at 50,000 because a batch drops by the previous batch's watermark, which
+trails what the batch reads by the 3-minute delay plus one batch's step (50,000 records are about 11 minutes of event
+time at about 78 records a second), so some records more than 3 minutes late still count.
+
+**What parsing costs** (the Arrow UDF that runs `decode` on every record, which day 4 left unmeasured): 200,000
+generated records (285 bytes each) cached in Spark's memory, best of 5 rounds, two runs (15:38 and 15:39, right
+after a test run: load average 9.5 and 10.3 at their starts, 8.7 and 8.1 at their ends):
+
+| What | Run 1 | Run 2 |
+|---|---|---|
+| `decode` in one Python process | 155,108 records/s | 156,585 records/s |
+| Spark, a scan summing the values' lengths (8 cores) | 44 ms | 35 ms |
+| Spark, `parse` with a filter on its verdict (8 cores) | 645 ms (310,110 records/s) | 571 ms (350,540 records/s) |
+| What the UDF adds | 3.01 µs a record | 2.68 µs a record |
+
+`.venv/bin/python scripts/measure_parse.py --records 200000 --rounds 5` at `ed5fb3f`. Parsing is per record and small
+next to a batch's fixed cost: at 3 µs a record, a 1 s trigger's 389-record batch spends about 1 ms parsing in each of
+the four queries, against 0.79 s for the batch, and a 50,000-record batch about 0.15 s. This run amortizes the UDF's
+per-batch costs (such as opening the Arrow streams to the Python workers) over 200,000 records, so it says nothing about
+those.
+
 ## Tests
 
 - `tests/test_schema.py`: every rule of the field table refuses a bad value with its reason; JSON edge cases
@@ -334,6 +441,20 @@ Day 4:
   nothing late.
 - `tests/test_cli.py`: `--start-ms` (and `now`) and `--sessions-per-second`, their errors; its Kafka test now skips
   without a broker (its marks were on a helper).
+
+Day 5:
+
+- `tests/test_quality.py`: a broken row per string format (each one character or one length from passing), and the
+  property that a raw event passes every row rule exactly when `decode` accepts its JSON: 300 generated events per
+  run, each with up to three fields replaced by values on either side of a rule (lengths 31/32, 255/256 and 64/65,
+  case, a space, DEL, NUL, a non-ASCII digit, a newline, the ranges' edges, NULL). Removing the page rule fails it.
+- `tests/test_report.py`: runs built by hand (Parquet files and sink logs, no Spark): the collected numbers, exact
+  cells of the page, the backfill's split and a gap minute, values and paths from the run escaped, nothing loaded
+  from elsewhere, the same bytes for the same numbers, an empty run, the one-day boundary of the minute axis, the
+  backlog note, stacked against grouped bars, the benchmark tables (a run that closed no window, a sleep of -0.0 s),
+  and the command (default path, a missing run, a bad results file).
+- `tests/test_docs.py`: every `.venv/bin/flowcast` command in a bash block of README, DESIGN, WALKTHROUGH and
+  CHANGELOG parses with the CLI's own parser; every `flowcast <subcommand>` and `scripts/...` they name exists.
 
 CI (`.github/workflows/ci.yml`): lint and types, and every test in two halves on separate runners (`-m spark` and
 `-m "not spark"`; conftest marks every test that takes the `spark` fixture), Spark on Temurin 21 with its jars cached,
@@ -453,8 +574,13 @@ reports doesn't hold here (the session keeps 10,000).
 - **The backfill is the stream's own code**, published by renaming a pointer file, so a reader never sees half of it.
 - **Readers before writers**: the decoder reads both versions; a producer upgraded first would send its records to
   dead letters, visibly, not to wrong answers.
+- **A static report, not a dashboard**: one HTML file with no scripts and nothing fetched, made from the same functions
+  as the CLI, so it can be kept, attached to a release and compared later; a pure `render` makes it testable cell by
+  cell.
+- **One definition of valid, twice**: the quality rules restate the decoder in SQL from the decoder's own patterns,
+  and a property test holds the two to each other, rather than trusting that the SQL was transcribed right.
 
-## Limitations (day 4)
+## Limitations (v1.0.0)
 
 - "Queryable" is when the sink's log names the batch: a reader still has to look. The views take the file list when
   they're made, so a dashboard that reconnects every few seconds adds that interval to every number here.
@@ -463,16 +589,11 @@ reports doesn't hold here (the session keeps 10,000).
 - The batch model covers available-now runs over a backlog, where the end offsets are fixed when the run starts. With a
   processing-time trigger on a live topic, each batch's end depends on what had arrived by then, which the model
   doesn't know; the cause (partitions level in records, a global watermark) is the same.
-- The live benchmark ran at one rate (100 sessions a second), on one laptop, in local mode, with the lid closed in a
-  dark wake on AC; it isn't a saturation test, and four queries share the cores, each reading and parsing Kafka on
-  its own.
+- The live benchmarks ran at one rate (100 sessions a second), on one laptop, in local mode; they aren't saturation
+  tests, and four queries share the cores, each reading and parsing Kafka on its own (one query with a shared source
+  would read and parse once).
 - "No window counts more than the raw events" is only conclusive on a stopped run (during one, `raw_events` can trail
   `minute_aggregates` by a batch); the other rules hold at any moment.
-
-## Limitations (day 3)
-
-- Three queries (four with `--duckdb`) each read Kafka and run the parse UDF: that many times the reading and parsing
-  of one query with a shared source (day 4 measures the cost).
 - `flowcast check` must run on a stopped job: on a live one a batch can commit between its reads. It compares raw
   events and dead letters by count, not record by record.
 - The check assumes copies of an event_id are identical, as the generator makes them; copies that differ (outside the
@@ -490,6 +611,11 @@ reports doesn't hold here (the session keeps 10,000).
 - `read_topic` gives up on any consumer error rather than retrying transient ones, and can't finish a compacted or
   transactional topic (it reads to the high-water mark). Untested still: its skip of records written after the
   snapshot, and `delete_topic` swallowing errors.
+- The report is one run's page, made when asked: it is not a live dashboard, and a run still writing shows the
+  batches committed when it was made. Its charts are per minute of event time; a run of days draws only the minutes
+  with rows.
+- Not measured: the job's ceiling beyond 50,000 records a batch, the UDF's per-batch cost (as opposed to its
+  per-record cost), and anything on more than one machine.
 
 ## License
 
