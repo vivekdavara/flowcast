@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flowcast"
-version = "0.1.0"
+version = "1.0.0"
 description = "Streaming analytics pipeline: a synthetic clickstream through Kafka and Spark Structured Streaming into Parquet and DuckDB."
 readme = "README.md"
 license = "MIT"

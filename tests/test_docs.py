@@ -2,10 +2,12 @@
 
 import re
 import shlex
+import tomllib
 from pathlib import Path
 
 import pytest
 
+from flowcast import __version__
 from flowcast.cli import build_parser
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,3 +58,11 @@ def test_every_script_named_exists() -> None:
     for name in DOCS:
         for script in re.findall(r"\bscripts/[A-Za-z0-9_.-]+\.(?:py|sh)\b", _text(name)):
             assert (ROOT / script).is_file(), (name, script)
+
+
+def test_the_version_is_the_same_everywhere() -> None:
+    """pyproject's version, the package's and the changelog's latest release are one version."""
+    project = tomllib.loads(_text("pyproject.toml"))["project"]["version"]
+    latest = re.search(r"^## v(\S+)", _text("CHANGELOG.md"), re.M)
+    assert latest is not None
+    assert project == __version__ == latest.group(1)

@@ -61,6 +61,12 @@ transformations and must equal the truth of every event; latency and throughput 
 times, and a model of Spark's batch split that explains its late drops; data-quality rules equal to the decoder; and a
 static HTML report of any run.
 
+![The report of day 3's kill run: events per minute, the late records only the backfill has in orange](docs/report.png)
+
+[`docs/report-kill-d3.html`](docs/report-kill-d3.html) is that page (download it to view it: GitHub shows HTML as
+source), and [`docs/report-live-1s.html`](docs/report-live-1s.html) the 1 s trigger run of "Results (day 5)" with
+every benchmark result.
+
 ## Layout
 
 ```
@@ -91,6 +97,7 @@ scripts/bench.py          the batch-size and trigger-interval benchmarks
 scripts/measure_generator.py, scripts/measure_encode.py, scripts/measure_parse.py
 tests/                    unit, property, differential, Kafka and Spark tests; tests/test_docs.py runs the
                           commands these documents show through the CLI's parser
+docs/                     a report of day 3's kill run and of today's trigger runs, and a screenshot
 ```
 
 ## How to run

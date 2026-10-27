@@ -396,6 +396,9 @@ as tables and a chart of latency by trigger.
 - Kafka integration tests (marked `kafka`) against a real broker: `FLOWCAST_TEST_BOOTSTRAP` points at it; locally
   `scripts/kafka.sh start`, in CI the service container. Each test uses a topic of its own and deletes it.
 - From day 2, Spark tests run small streams end to end and compare with the truth.
+- From day 5, `tests/test_docs.py` runs every command the documents show through the CLI's parser and checks that the
+  version agrees everywhere; the report's tests build runs by hand (Parquet and sink logs) and check the page cell by
+  cell.
 
 ## The days
 
@@ -405,4 +408,4 @@ as tables and a chart of latency by trigger.
 | 2 | A producer at volume (batching, pacing by arrival time, delivery accounting); the Spark job: parse and validate, dead letters, raw events, windowed aggregates with a watermark, Parquet; DuckDB views; Spark output checked against the truth. |
 | 3 | Exactly-once across a killed and restarted job (checkpoints, the file sink's log, an idempotent DuckDB sink; crash states and real SIGKILLs; restarts recorded); late-data accounting against Spark's metrics; schema version 2; the batch backfill sharing the transformations. |
 | 4 | Latency (produced, event time and window end to queryable) and throughput from the sink logs and progress reports; benchmarks over batch sizes and trigger intervals; data-quality rules over the outputs; CI split into Spark and non-Spark jobs. |
-| 5 | A static HTML report; README with results; WALKTHROUGH.md; v1.0.0. |
+| 5 | The static HTML report (`flowcast report`); quality rules for the decoder's string formats, held to the decoder; views with every column whatever the files hold; the trigger comparison with windows closing, a dense backlog and the parse cost; the documents checked against the CLI; v1.0.0. |

@@ -4,6 +4,11 @@ The questions an interviewer is likely to ask about FlowCast, with short answers
 the left half of the pipeline (event schema, generator, ground truth, local Kafka, the round trip, CI); later days
 add their own sections.
 
+Reading order for day 5 (the release): README "Results at a glance" and "Results (day 5, v1.0.0)" → `DESIGN.md` "The
+report (day 5)" → `src/flowcast/report.py` (`collect`, `render`, `bar_chart`, `load_bench`) → `src/flowcast/quality.py`
+(`_not_matching`) with `schema.STRING_FORMATS` → `src/flowcast/views.py` (`_create_view`) → `tests/test_report.py`,
+the end of `tests/test_quality.py` → `docs/report-kill-d3.html` in a browser.
+
 Reading order for day 1: `DESIGN.md` → `src/flowcast/schema.py` → `src/flowcast/generator.py` (`Generator.__iter__`,
 `_session`, `_emit`) → `src/flowcast/truth.py` and `src/flowcast/sql/minute_aggregates.sql` →
 `src/flowcast/kafka_io.py` (`produce`, `read_topic`) → `scripts/kafka.sh` → `.github/workflows/ci.yml`.
@@ -407,3 +412,11 @@ Over a dense backlog of 200,000 records, 18,139 rows a second through raw_events
 batch because each batch carries a fixed cost; on the live stream at 375 records a second the job was nowhere near
 that ceiling at 5 and 10 s triggers (busy 8 to 17% of the time) and near it at 1 s. Those are one laptop's numbers in
 local mode, four queries sharing its cores.
+
+**What went wrong on day 5?**
+Running the quality rules over every run kept on disk, to back a claim in the README, failed on day 2's demo run with
+a DuckDB binder error: its raw files all predate schema version 2, and `union_by_name` only gives a column some file
+has, so there was no `campaign` column and every rule naming it failed. The tests had covered a mix of old and new
+files, never only old ones. `views._create_view` now adds any column no file has as NULL. Smaller: the report first
+showed a benchmark's sleep of -0.0 s as "-0", and labelled a count axis's 0.5 tick as "0". And the Mac went to sleep
+with its lid closed at 15:45 for 93 minutes; the commits after that are bunched at the end.
