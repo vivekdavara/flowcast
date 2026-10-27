@@ -102,9 +102,19 @@ def test_with_a_backfill_each_minute_carries_its_events(tmp_path: Path) -> None:
     )
     page = render(r)
     assert "what the stream dropped as late: 4 events in all" in page
+    # The tile counts the stream's minutes, not the backfill's extra one (mutation pass).
+    assert "<b>3</b><span>minutes in the windows</span>" in page
     assert "only in the backfill (late)" in page  # the legend: two series
     # The minute with no rows at all (T0 + 180 s) is drawn as a gap, and appears in the table as zeros.
     assert "<td>2026-01-01 00:03</td><td class=num>0</td><td class=num>0</td><td class=num>0</td>" in page
+
+
+def test_event_types_are_listed_by_their_events(tmp_path: Path) -> None:
+    """Most events first, ties by name: not alphabetical (mutation pass)."""
+    data = clean()
+    data["minute_aggregates"] += [aggregate(T0, "add_to_cart", 1, 0), aggregate(T0, "checkout", 500, 0)]
+    r = collect(run_dir(tmp_path, data), GENERATED)
+    assert [t for t, _, _ in r.types] == ["checkout", "page_view", "add_to_cart", "purchase"]
 
 
 def test_the_page_shows_the_numbers(tmp_path: Path) -> None:

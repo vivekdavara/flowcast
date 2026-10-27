@@ -29,6 +29,15 @@ def test_percentiles_are_nearest_rank() -> None:
         percentile([1.0], 0)
 
 
+def test_percentile_ranks_are_exact_in_any_float_order() -> None:
+    """ceil(p * n / 100) in floats is wrong too, for other p and n than the review's (mutation pass, day 5): 64.4% of
+    250 is 161 exactly, and 64.4 * 250 / 100 is 161.00000000000003."""
+    values = [float(v) for v in range(1, 1001)]
+    assert percentile(values[:250], 64.4) == 161
+    assert percentile(values[:375], 8.8) == 33
+    assert percentile(values, 16.1) == 161
+
+
 def test_a_summary_sorts_first() -> None:
     assert Summary.of([30.0, 10.0, 20.0]) == Summary(3, 20, 30, 30, 30)
     assert Summary(3, 20, 30, 30, 30).line("x") == "x: 3 rows, p50 20 ms, p95 30 ms, p99 30 ms, max 30 ms"
@@ -55,6 +64,16 @@ def test_each_batch_has_its_own_files_and_commit_time(tmp_path: Path) -> None:
         (4, T0 + 5_000, (f[4],)),
     ]
     assert commits(tmp_path / "missing") == []
+
+
+def test_a_deleted_file_listed_again_is_the_compact_batchs_own(tmp_path: Path) -> None:
+    """A delete takes a file out of the live set, so a compact that lists it again added it in its own batch
+    (mutation pass, day 5: without the delete, the file was counted as an old one)."""
+    f = [tmp_path / f"part-{n}.parquet" for n in range(2)]
+    commit_at(tmp_path, "0", [(f[0], "add"), (f[1], "add")], T0 + 1_000)
+    commit_at(tmp_path, "1", [(f[0], "delete")], T0 + 2_000)
+    commit_at(tmp_path, "2.compact", [(f[0], "add"), (f[1], "add")], T0 + 3_000)
+    assert [(c.batch, c.files) for c in commits(tmp_path)] == [(0, (f[0], f[1])), (1, ()), (2, (f[0],))]
 
 
 def test_a_log_cleaned_up_before_a_compact_is_refused(tmp_path: Path) -> None:
